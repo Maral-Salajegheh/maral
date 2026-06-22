@@ -94,10 +94,6 @@ semantic_lookup AS (
         laenge_2
     FROM SST_SEMANTIK
     WHERE NULLIF(TRIM(sst), '') IS NOT NULL
-    QUALIFY ROW_NUMBER() OVER (
-        PARTITION BY UPPER(TRIM(sst))
-        ORDER BY UPPER(TRIM(sst))
-    ) = 1
 ),
 
 qa_workers AS (
@@ -191,4 +187,3 @@ SELECT *
 FROM PROC_LIFE_FINAL_DOCUMENT_LABELS
 WHERE has_sst
   AND training_label_quality IN ('GOLD', 'SILVER');
-

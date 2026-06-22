@@ -43,6 +43,51 @@ PIPELINE_STEPS = [
     ("04_stack_aggregation.sql", "PROC_LIFE_STACK_AGG"),
 ]
 
+# Every completed stage must satisfy these data-grain contracts. A stage can
+# have more than one contract when it creates both a processed table and a
+# training view.
+GRAIN_CONTRACTS = {
+    "00_completed_stacks.sql": [
+        ("PROC_LIFE_COMPLETED_STACKS", ["STACK_ID"]),
+    ],
+    "01_final_document_labels.sql": [
+        (
+            "PROC_LIFE_FINAL_DOCUMENT_LABELS",
+            ["STACK_ID", "PROCESS_ID", "DOC_ID", "SUBDOC_IDX"],
+        ),
+        (
+            "TRAINING_LIFE_DOCUMENT_LABELS",
+            ["STACK_ID", "PROCESS_ID", "DOC_ID", "SUBDOC_IDX"],
+        ),
+    ],
+    "02_final_page_labels.sql": [
+        (
+            "PROC_LIFE_FINAL_PAGE_LABELS",
+            [
+                "STACK_ID",
+                "PROCESS_ID",
+                "EXPORT_ENTRY_ID",
+                "IMAGE_ID",
+                "DOC_ID",
+                "SUBDOC_IDX",
+            ],
+        ),
+        (
+            "TRAINING_LIFE_PAGE_LABELS",
+            ["STACK_ID", "PROCESS_ID", "IMAGE_ID"],
+        ),
+    ],
+    "03_page_grouping_changes.sql": [
+        (
+            "PROC_LIFE_PAGE_GROUPING_CHANGES",
+            ["STACK_ID", "PROCESS_ID", "IMAGE_ID"],
+        ),
+    ],
+    "04_stack_aggregation.sql": [
+        ("PROC_LIFE_STACK_AGG", ["STACK_ID"]),
+    ],
+}
+
 REQUIRED_INPUT_TABLES = {
     "AD_STACK",
     "AD_DOCUMENT",
@@ -101,6 +146,114 @@ def validate_input_tables(engine: sqlalchemy.Engine, schema: str) -> None:
     print("Required tables:", ", ".join(sorted(REQUIRED_INPUT_TABLES)))
 
 
+def fetch_scalar(
+    engine: sqlalchemy.Engine,
+    query: str,
+    parameters: dict[str, object] | None = None,
+) -> int:
+    """Execute a scalar validation query and return its integer result."""
+    with engine.connect() as connection:
+        value = connection.execute(
+            sqlalchemy.text(query), parameters or {}
+        ).scalar_one()
+    return int(value)
+
+
+def validate_semantic_uniqueness(
+    engine: sqlalchemy.Engine,
+    schema: str,
+) -> None:
+    """Reject real SST codes with multiple semantic definitions.
+
+    Blank semantic rows are intentionally ignored. They are not valid SST codes
+    and are already excluded by the label-building SQL.
+    """
+    duplicate_count = fetch_scalar(
+        engine,
+        f"""
+        SELECT COUNT(*)
+        FROM (
+            SELECT UPPER(TRIM(sst)) AS normalized_sst
+            FROM {schema}.SST_SEMANTIK
+            WHERE NULLIF(TRIM(sst), '') IS NOT NULL
+            GROUP BY UPPER(TRIM(sst))
+            HAVING COUNT(*) > 1
+        )
+        """,
+    )
+    if duplicate_count > 0:
+        raise RuntimeError(
+            "SST_SEMANTIK contains "
+            f"{duplicate_count} duplicated non-empty SST codes. "
+            "The pipeline will not choose a semantic row arbitrarily."
+        )
+    print("Semantic uniqueness validation passed.")
+
+
+def validate_process_id_stability(
+    engine: sqlalchemy.Engine,
+    schema: str,
+) -> None:
+    """Ensure a physical page keeps its process_id from Analyser to Export.
+
+    The grouping SQL joins by stack_id, process_id, and image_id. If process_id
+    changes for the same stack/image pair, the page would be misclassified as
+    removed and added instead of being compared directly.
+    """
+    mismatch_count = fetch_scalar(
+        engine,
+        f"""
+        WITH first_analyser AS (
+            SELECT stack_id, entry_id
+            FROM {schema}.AD_STACK
+            WHERE state = 'Analyser1'
+            QUALIFY ROW_NUMBER() OVER (
+                PARTITION BY stack_id
+                ORDER BY entry_time, entry_id
+            ) = 1
+        ),
+        last_export AS (
+            SELECT stack_id, entry_id
+            FROM {schema}.AD_STACK
+            WHERE state = 'AfterExport'
+            QUALIFY ROW_NUMBER() OVER (
+                PARTITION BY stack_id
+                ORDER BY entry_time DESC, entry_id DESC
+            ) = 1
+        ),
+        analyser_pages AS (
+            SELECT DISTINCT p.stack_id, p.image_id, p.process_id
+            FROM {schema}.AD_IMAGE2DOCUMENT AS p
+            INNER JOIN first_analyser AS a
+                ON p.stack_id = a.stack_id
+               AND p.entry_id = a.entry_id
+            WHERE p.image_id IS NOT NULL
+        ),
+        export_pages AS (
+            SELECT DISTINCT p.stack_id, p.image_id, p.process_id
+            FROM {schema}.AD_IMAGE2DOCUMENT AS p
+            INNER JOIN last_export AS e
+                ON p.stack_id = e.stack_id
+               AND p.entry_id = e.entry_id
+            WHERE p.image_id IS NOT NULL
+        )
+        SELECT COUNT(*)
+        FROM analyser_pages AS a
+        INNER JOIN export_pages AS e
+            ON a.stack_id = e.stack_id
+           AND a.image_id = e.image_id
+        WHERE NOT EQUAL_NULL(a.process_id, e.process_id)
+        """,
+    )
+    if mismatch_count > 0:
+        raise RuntimeError(
+            "process_id is not stable for "
+            f"{mismatch_count} matched Analyser/Export page pairs. "
+            "PROC_LIFE_PAGE_GROUPING_CHANGES would misclassify those pages."
+        )
+    print("Analyser-to-Export process_id stability validation passed.")
+
+
 def read_sql_file(path: Path, schema: str) -> str:
     """Read one SQL stage and explicitly select the target schema."""
     sql_contents = path.read_text(encoding="utf-8")
@@ -121,6 +274,65 @@ def verify_output_table(
         )
 
 
+def validate_grain_contract(
+    engine: sqlalchemy.Engine,
+    schema: str,
+    object_name: str,
+    key_columns: list[str],
+) -> None:
+    """Require a non-empty output with no duplicate expected-grain keys."""
+    column_sql = ", ".join(key_columns)
+
+    row_count = fetch_scalar(
+        engine,
+        f"SELECT COUNT(*) FROM {schema}.{object_name}",
+    )
+    if row_count == 0:
+        raise RuntimeError(
+            f"Postcondition failed: {schema}.{object_name} is empty."
+        )
+
+    duplicate_group_count = fetch_scalar(
+        engine,
+        f"""
+        SELECT COUNT(*)
+        FROM (
+            SELECT {column_sql}
+            FROM {schema}.{object_name}
+            GROUP BY {column_sql}
+            HAVING COUNT(*) > 1
+        )
+        """,
+    )
+    if duplicate_group_count > 0:
+        raise RuntimeError(
+            f"Postcondition failed: {schema}.{object_name} contains "
+            f"{duplicate_group_count} duplicated grain keys for "
+            f"({column_sql})."
+        )
+
+    print(
+        f"Grain validation passed for {schema}.{object_name}: "
+        f"{row_count:,} rows, key ({column_sql})."
+    )
+
+
+def validate_stage_outputs(
+    engine: sqlalchemy.Engine,
+    schema: str,
+    filename: str,
+) -> None:
+    """Run every declared grain contract for a completed pipeline stage."""
+    for object_name, key_columns in GRAIN_CONTRACTS[filename]:
+        verify_output_table(engine, schema, object_name)
+        validate_grain_contract(
+            engine=engine,
+            schema=schema,
+            object_name=object_name,
+            key_columns=key_columns,
+        )
+
+
 def run_pipeline(schema: str, assume_yes: bool = False) -> None:
     """Validate and execute all Life pipeline stages in dependency order."""
     schema = validate_identifier(schema)
@@ -128,6 +340,7 @@ def run_pipeline(schema: str, assume_yes: bool = False) -> None:
 
     engine = get_engine(schema=schema)
     validate_input_tables(engine, schema)
+    validate_semantic_uniqueness(engine, schema)
 
     print(f"\nTarget schema: {schema}")
     print("Pipeline stages:")
@@ -149,11 +362,15 @@ def run_pipeline(schema: str, assume_yes: bool = False) -> None:
         stage_start = perf_counter()
 
         print(f"\n[{index}/{len(PIPELINE_STEPS)}] Executing {filename}")
+
+        if filename == "03_page_grouping_changes.sql":
+            validate_process_id_stability(engine, schema)
+
         sql = read_sql_file(path, schema)
 
         try:
             execute_query(engine, sql)
-            verify_output_table(engine, schema, expected_output)
+            validate_stage_outputs(engine, schema, filename)
         except Exception as exc:
             elapsed = perf_counter() - stage_start
             print(f"FAILED after {elapsed:.2f} seconds: {filename}")

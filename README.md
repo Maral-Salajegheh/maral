@@ -11,6 +11,18 @@ than a direct substitution of PnC `sfdoc_class` with Life SST.
 4. `03_page_grouping_changes.sql`
 5. `04_stack_aggregation.sql`
 
+Run the complete dependency-ordered pipeline through the Python orchestrator:
+
+```bash
+python run_pipeline.py D131_D2D
+```
+
+The runner validates the required inputs, executes only the five listed SQL
+stages, verifies the main output after each stage, enforces output-grain
+uniqueness, checks semantic uniqueness and page process-ID stability, and stops
+on the first error.
+Use `--yes` only for non-interactive/automated execution.
+
 ## Outputs
 
 | Output | Grain | Purpose |
@@ -43,4 +55,3 @@ than a direct substitution of PnC `sfdoc_class` with Life SST.
 
 The underlying `label_tier` is retained so that training and evaluation can be
 reported separately for Gold and Silver labels.
-
