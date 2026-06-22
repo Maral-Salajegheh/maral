@@ -794,3 +794,85 @@ HAVING COUNT(*) > 1
 ORDER BY n_rows DESC
 LIMIT 500;
 
+
+
+/*
+Classify final Export SST labels by verifier type.
+
+Label tiers:
+- QA_VERIFIED: verified by one of the known QA workers.
+- SYSTEM_VERIFIED: verified_by is System.
+- SERVICE_ACCOUNT: verified by a technical/service account.
+- NON_QA_HUMAN: another named verifier, likely human but not in QA_ID.
+*/
+
+WITH last_export AS (
+    SELECT
+        stack_id,
+        entry_id,
+        entry_time
+    FROM AD_STACK
+    WHERE state = 'AfterExport'
+    QUALIFY ROW_NUMBER() OVER (
+        PARTITION BY stack_id
+        ORDER BY entry_time DESC, entry_id DESC
+    ) = 1
+),
+
+export_sst AS (
+    SELECT
+        f.stack_id,
+        f.process_id,
+        f.doc_id,
+        f.subdoc_idx,
+        f.entry_id,
+        f.field_value AS sst
+    FROM AD_FIELD AS f
+    INNER JOIN last_export AS e
+        ON f.stack_id = e.stack_id
+        AND f.entry_id = e.entry_id
+    WHERE UPPER(TRIM(f.field_name)) = 'SST'
+      AND NULLIF(TRIM(f.field_value), '') IS NOT NULL
+),
+
+label_evidence AS (
+    SELECT
+        s.stack_id,
+        s.process_id,
+        s.doc_id,
+        s.subdoc_idx,
+        s.sst,
+        d.verified_by,
+        CASE
+            WHEN q.id IS NOT NULL
+                THEN 'QA_VERIFIED'
+            WHEN UPPER(TRIM(d.verified_by)) = 'SYSTEM'
+                THEN 'SYSTEM_VERIFIED'
+            WHEN UPPER(TRIM(d.verified_by)) LIKE 'SVC%'
+                THEN 'SERVICE_ACCOUNT'
+            WHEN NULLIF(TRIM(d.verified_by), '') IS NOT NULL
+                THEN 'NON_QA_HUMAN'
+            ELSE 'MISSING_VERIFIER'
+        END AS label_tier
+    FROM export_sst AS s
+    LEFT JOIN AD_DOCUMENT AS d
+        ON s.stack_id = d.stack_id
+        AND s.process_id = d.process_id
+        AND s.doc_id = d.doc_id
+        AND s.subdoc_idx = d.subdoc_idx
+        AND s.entry_id = d.entry_id
+    LEFT JOIN QA_ID AS q
+        ON UPPER(TRIM(d.verified_by)) = UPPER(TRIM(q.id))
+)
+
+SELECT
+    label_tier,
+    COUNT(*) AS n_document_labels,
+    COUNT(DISTINCT stack_id) AS n_stacks,
+    ROUND(
+        100 * COUNT(*) / SUM(COUNT(*)) OVER (),
+        2
+    ) AS label_percentage
+FROM label_evidence
+GROUP BY label_tier
+ORDER BY n_document_labels DESC;
