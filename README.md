@@ -46,6 +46,9 @@ Use `--yes` only for non-interactive/automated execution.
 - `altered_by <> 'System'` labelled as manual effort or FTE.
 - Snowflake primary-key declarations used as a substitute for validation.
 
+
+22 stacks have non-standard category (10 AXAPnC/Default, 1 leben, 11 multi-category). Kept in PROC_LIFE_STACK_AGG, flagged via has_unambiguous_category. Training extraction must filter: has_unambiguous_category AND category IN ('Antrag','Bestand').
+
 ## Label policy
 
 - `GOLD`: QA worker verified.
