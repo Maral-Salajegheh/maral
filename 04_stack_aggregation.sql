@@ -45,6 +45,7 @@ workflow AS (
             s.altered_by,
             NULL
         )) AS n_distinct_named_non_system_actors,
+         MAX(s.category) AS category,
 
         ARRAY_AGG(DISTINCT s.subsystem)
             WITHIN GROUP (ORDER BY s.subsystem) AS subsystem_list,
@@ -94,6 +95,7 @@ grouping_summary AS (
 
 SELECT
     w.stack_id,
+    w.category,
     w.subsystem_list,
     w.category_list,
     w.first_import_time,
