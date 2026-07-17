@@ -1,25 +1,29 @@
 from __future__ import annotations
 
-import base64
-import json
-import os
+import time
 from pathlib import Path
-from typing import Any, Literal
+from typing import Literal
 
-from pydantic import BaseModel, ValidationError
-
-from axallm.securegpt.v2.providers import OpenAIProvider
+from axallm.utils import read_image_base64
 from axallm.securegpt.v2.securegpt import SecureGPT
+from pydantic import BaseModel, Field
 
 
-MODEL_NAME = os.getenv("SECUREGPT_MODEL_NAME", "")
-MODEL_VERSION = os.getenv("SECUREGPT_MODEL_VERSION", "")
+# Copy the exact complete model ID from SecureGPT Model Hub.
+MODEL = "PUT-EXACT-MODEL-ID-HERE"
 
 TEMPERATURE = 0
 SEED = 42
 
+# Five total attempts:
+# attempt 1, then retries after 1, 2, 4 and 8 seconds.
+MAX_ATTEMPTS = 5
+RETRY_DELAYS_SECONDS = [1, 2, 4, 8]
+
 
 class AusweisPageResponse(BaseModel):
+    """Structured output returned by SecureGPT."""
+
     label: Literal[
         "ausweiskopie",
         "not_ausweiskopie",
@@ -35,6 +39,27 @@ class AusweisPageResponse(BaseModel):
         "no_id_features",
         "unreadable_or_ambiguous",
     ]
+
+    confidence: float = Field(
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Confidence in the selected label. "
+            "Use a value between 0.0 and 1.0."
+        ),
+    )
+
+
+class SecureGPTScreeningError(RuntimeError):
+    """SecureGPT failure including the number of attempted calls."""
+
+    def __init__(
+        self,
+        message: str,
+        attempts: int,
+    ) -> None:
+        super().__init__(message)
+        self.attempts = attempts
 
 
 SYSTEM_PROMPT = """
@@ -77,146 +102,178 @@ Beachte folgende Regeln:
    Identitätsdokuments gilt als ausweiskopie, sofern sie eindeutig als Teil
    eines Identitätsdokuments erkennbar ist.
 
-4. Krankenversicherungskarten, Bankkarten, Kundenkarten, Mitarbeiterausweise,
-   Führerscheine und reine Passfotos gelten nicht als Ausweiskopie.
+4. Krankenversicherungskarten, Bankkarten, Kundenkarten,
+   Mitarbeiterausweise, Führerscheine und reine Passfotos gelten nicht als
+   Ausweiskopie.
 
 5. Wenn nicht zuverlässig entschieden werden kann, verwende unclear.
    Rate nicht.
 
 6. Gib niemals personenbezogene Inhalte wieder. Transkribiere insbesondere
-   keine Namen, Geburtsdaten, Anschriften, Dokumentennummern, Unterschriften
-   oder MRZ-Inhalte.
+   keine Namen, Geburtsdaten, Anschriften, Dokumentennummern,
+   Unterschriften oder MRZ-Inhalte.
 
-7. Gib ausschließlich die angeforderte strukturierte Antwort zurück.
+7. Gib zusätzlich einen confidence-Wert zwischen 0.0 und 1.0 zurück:
+
+   - 0.90 bis 1.00:
+     Das Ergebnis ist visuell eindeutig.
+
+   - 0.60 bis 0.89:
+     Das Ergebnis ist wahrscheinlich, aber nicht vollständig eindeutig.
+
+   - unter 0.60:
+     Das Ergebnis ist stark unsicher und sollte manuell geprüft werden.
+
+8. Verwende bei stark unsicheren Bildern vorzugsweise das Label unclear.
+
+9. Gib ausschließlich die angeforderte strukturierte Antwort zurück.
 """.strip()
 
 
 USER_PROMPT = """
 Prüfe dieses Seitenbild.
 
-Klassifiziere es als:
+Gib zurück:
 
-- ausweiskopie
-- not_ausweiskopie
-- unclear
+- label
+- evidence_code
+- confidence
 
-Gib zusätzlich genau einen zulässigen evidence_code zurück.
 Gib keine personenbezogenen Informationen zurück.
 """.strip()
 
 
-def validate_configuration() -> None:
-    if not MODEL_NAME:
-        raise ValueError("SECUREGPT_MODEL_NAME is not set.")
-
-    if not MODEL_VERSION:
-        raise ValueError("SECUREGPT_MODEL_VERSION is not set.")
-
-
-def image_to_data_url(image_path: Path) -> str:
-    """Convert a local PNG or JPEG image to a Base64 data URL."""
-    if not image_path.exists():
-        raise FileNotFoundError(f"Image not found: {image_path}")
-
-    suffix = image_path.suffix.lower()
-
-    if suffix == ".png":
-        mime_type = "image/png"
-    elif suffix in {".jpg", ".jpeg"}:
-        mime_type = "image/jpeg"
-    else:
+def create_securegpt_client() -> SecureGPT:
+    """Create one SecureGPT client for the complete screening run."""
+    if not MODEL or MODEL == "PUT-EXACT-MODEL-ID-HERE":
         raise ValueError(
-            f"Unsupported image format: {image_path.suffix}"
+            "Set MODEL_ID to the exact model identifier from Model Hub."
         )
 
-    encoded_image = base64.b64encode(
-        image_path.read_bytes()
-    ).decode("utf-8")
-
-    return f"data:{mime_type};base64,{encoded_image}"
-
-
-def create_securegpt_client() -> SecureGPT:
-    """Create one approved internal AXA SecureGPT client."""
-    validate_configuration()
-
     return SecureGPT(
-        provider=OpenAIProvider(),
-        model=MODEL_NAME,
-        cache_prompts=True,
-        seed=SEED,
+        model=MODEL,
         temperature=TEMPERATURE,
-        debug=False,
+        seed=SEED,
+        cache_prompts=False,
     )
 
 
-def _answer_value(response: Any) -> Any:
-    return response.answer if hasattr(response, "answer") else response
+def is_retryable_securegpt_error(
+    error: Exception,
+) -> bool:
+    """Return True for temporary infrastructure errors."""
+    error_text = str(error).lower()
 
+    retryable_markers = [
+        "routing failed",
+        "backend not available",
+        "backend unavailable",
+        "esg120",
+        "error code: 500",
+        "error code: 502",
+        "error code: 503",
+        "error code: 504",
+        "status code: 500",
+        "status code: 502",
+        "status code: 503",
+        "status code: 504",
+        "timeout",
+        "timed out",
+        "connection reset",
+        "temporarily unavailable",
+        "too many requests",
+        "rate limit",
+        "error code: 429",
+        "status code: 429",
+    ]
 
-def _parse_answer(answer: Any) -> AusweisPageResponse:
-    if isinstance(answer, AusweisPageResponse):
-        return answer
-
-    if isinstance(answer, dict):
-        return AusweisPageResponse.model_validate(answer)
-
-    if isinstance(answer, str):
-        return AusweisPageResponse.model_validate_json(answer)
-
-    raise TypeError(
-        "Unsupported SecureGPT answer type: "
-        f"{type(answer).__name__}"
+    return any(
+        marker in error_text
+        for marker in retryable_markers
     )
 
 
 def screen_image(
     client: SecureGPT,
     image_path: Path,
-) -> dict[str, str]:
+) -> dict[str, str | float | int]:
     """
-    Send one page image to SecureGPT.
+    Classify one rendered page.
 
-    The wrapper is first called with Pydantic structured output. If the
-    installed version does not support response_model together with
-    user_image, it falls back to strict JSON and validates locally.
+    Temporary errors are retried with delays of 1, 2, 4 and 8 seconds.
     """
-    image_data_url = image_to_data_url(image_path)
-
-    try:
-        response = client.new_chat(
-            system_prompt=SYSTEM_PROMPT,
-            user_prompt=USER_PROMPT,
-            user_image=image_data_url,
-            response_model=AusweisPageResponse,
+    if not image_path.exists():
+        raise FileNotFoundError(
+            f"Rendered image not found: {image_path}"
         )
-        parsed = _parse_answer(_answer_value(response))
 
-    except TypeError:
-        fallback_prompt = (
-            USER_PROMPT
-            + "\nReturn valid JSON only with exactly these keys: "
-            + json.dumps(
-                {
-                    "label": "ausweiskopie",
-                    "evidence_code": "id_card_layout",
-                }
+    image_base64 = read_image_base64(
+        str(image_path)
+    )
+
+    last_error: Exception | None = None
+
+    for attempt_index in range(MAX_ATTEMPTS):
+        attempt_number = attempt_index + 1
+
+        try:
+            response = client.new_chat(
+                system_prompt=SYSTEM_PROMPT,
+                user_prompt=USER_PROMPT,
+                user_image=image_base64,
+                image_detail="high",
+                response_model=AusweisPageResponse,
             )
-        )
 
-        response = client.new_chat(
-            system_prompt=SYSTEM_PROMPT,
-            user_prompt=fallback_prompt,
-            user_image=image_data_url,
-        )
-        parsed = _parse_answer(_answer_value(response))
+            parsed = response.answer
 
-    except ValidationError as error:
-        raise ValueError(
-            "SecureGPT returned an invalid structured response."
-        ) from error
+            if not isinstance(
+                parsed,
+                AusweisPageResponse,
+            ):
+                parsed = AusweisPageResponse.model_validate(
+                    parsed
+                )
 
-    return {
-        "label": parsed.label,
-        "evidence_code": parsed.evidence_code,
-    }
+            return {
+                "label": parsed.label,
+                "evidence_code": parsed.evidence_code,
+                "confidence": float(parsed.confidence),
+                "attempt_count": attempt_number,
+                "retry_count": attempt_index,
+            }
+
+        except Exception as error:
+            last_error = error
+
+            if not is_retryable_securegpt_error(error):
+                raise SecureGPTScreeningError(
+                    message=(
+                        "Non-retryable SecureGPT error for "
+                        f"{image_path}: {error}"
+                    ),
+                    attempts=attempt_number,
+                ) from error
+
+            if attempt_number == MAX_ATTEMPTS:
+                break
+
+            delay_seconds = RETRY_DELAYS_SECONDS[
+                attempt_index
+            ]
+
+            print(
+                f"Temporary SecureGPT error for {image_path.name}. "
+                f"Attempt {attempt_number}/{MAX_ATTEMPTS}. "
+                f"Retrying in {delay_seconds} seconds."
+            )
+
+            time.sleep(delay_seconds)
+
+    raise SecureGPTScreeningError(
+        message=(
+            f"SecureGPT failed after {MAX_ATTEMPTS} attempts "
+            f"for {image_path}. Last error: {last_error}"
+        ),
+        attempts=MAX_ATTEMPTS,
+    ) from last_error
