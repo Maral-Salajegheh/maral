@@ -45,6 +45,8 @@ workflow AS (
             s.altered_by,
             NULL
         )) AS n_distinct_named_non_system_actors,
+         MAX(s.category) AS category,
+        (COUNT(DISTINCT s.category) = 1) AS has_unambiguous_category,
 
         ARRAY_AGG(DISTINCT s.subsystem)
             WITHIN GROUP (ORDER BY s.subsystem) AS subsystem_list,
@@ -94,6 +96,8 @@ grouping_summary AS (
 
 SELECT
     w.stack_id,
+    w.category,
+    w.has_unambiguous_category,
     w.subsystem_list,
     w.category_list,
     w.first_import_time,
@@ -109,6 +113,12 @@ SELECT
         AS hours_import_to_first_analyser,
     DATEDIFF('second', w.first_analyser_time, w.last_export_time) / 3600.0
         AS hours_first_analyser_to_export,
+    DATEDIFF('second', w.first_import_time, w.first_supervisor_time) / 3600.0
+        AS hours_import_to_first_supervisor,
+    DATEDIFF('second', w.first_import_time, w.first_verifier_time) / 3600.0
+        AS hours_import_to_first_verifier,
+    DATEDIFF('second', w.first_import_time, w.first_supervisor2_time) / 3600.0
+        AS hours_import_to_first_supervisor2,
 
     w.n_analyser_events,
     w.n_supervisor_events,
