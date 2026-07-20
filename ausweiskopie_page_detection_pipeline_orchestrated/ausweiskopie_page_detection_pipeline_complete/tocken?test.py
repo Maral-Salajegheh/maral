@@ -1,55 +1,76 @@
 from pathlib import Path
-import argparse
 
-from securegpt_vision_original_plus_confidence_retry import (
+from securegpt_vision import (
     AusweisPageResponse,
     SYSTEM_PROMPT,
     USER_PROMPT,
     create_securegpt_client,
-    image_to_data_url,
+    read_image_base64,
 )
 
 
+# مسیر یک عکس واقعی برای تست
+IMAGE_PATH = Path("path/to/test_image.png")
+
+
 def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Test one image and inspect the raw SecureGPT response."
-    )
-    parser.add_argument(
-        "image_path",
-        type=Path,
-        help="Path to one PNG or JPEG image.",
-    )
-    args = parser.parse_args()
+    if not IMAGE_PATH.exists():
+        raise FileNotFoundError(
+            f"Test image not found: {IMAGE_PATH}"
+        )
 
     client = create_securegpt_client()
-    image_data_url = image_to_data_url(args.image_path)
+
+    image_base64 = read_image_base64(
+        IMAGE_PATH
+    )
 
     response = client.new_chat(
         system_prompt=SYSTEM_PROMPT,
         user_prompt=USER_PROMPT,
-        user_image=image_data_url,
+        user_image=image_base64,
+        image_detail="high",
         response_model=AusweisPageResponse,
     )
 
     print("\n--- RESPONSE ---")
     print(response)
 
+    print("\n--- RESPONSE TYPE ---")
+    print(type(response))
+
     print("\n--- RESPONSE ATTRIBUTES ---")
     try:
         print(vars(response))
     except TypeError:
-        print("vars(response) is not available for this response type.")
+        print(
+            "vars(response) is not supported "
+            "for this response object."
+        )
 
-    print("\n--- POSSIBLE USAGE FIELDS ---")
-    for field_name in (
+    print("\n--- POSSIBLE TOKEN USAGE ---")
+
+    field_names = [
         "usage",
         "token_usage",
         "prompt_tokens",
         "completion_tokens",
         "total_tokens",
+        "input_tokens",
+        "output_tokens",
         "metadata",
-    ):
-        print(f"{field_name}: {getattr(response, field_name, None)}")
+    ]
+
+    for field_name in field_names:
+        value = getattr(
+            response,
+            field_name,
+            None,
+        )
+
+        print(
+            f"{field_name}: {value}"
+        )
 
 
 if __name__ == "__main__":
