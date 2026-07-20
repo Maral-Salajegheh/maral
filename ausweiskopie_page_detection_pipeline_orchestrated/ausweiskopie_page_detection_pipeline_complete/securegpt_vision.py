@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+import base64
+import json
+import os
 import time
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
-from axallm.utils import read_image_base64
+from pydantic import BaseModel, Field, ValidationError
+
+from axallm.securegpt.v2.providers import OpenAIProvider
 from axallm.securegpt.v2.securegpt import SecureGPT
-from pydantic import BaseModel, Field
 
 
 # Copy the exact complete model ID from SecureGPT Model Hub.
@@ -141,6 +145,14 @@ Gib zurück:
 
 Gib keine personenbezogenen Informationen zurück.
 """.strip()
+
+
+def read_image_base4(image_path) -> str;
+    """Return one image file as base64/encoded UTF/8 text."""
+    with open (image_path, "rb") as image_file:
+        return base64.b64encode(
+            image_file.read()
+        ).decode("utf-8")
 
 
 def create_securegpt_client() -> SecureGPT:
