@@ -14,10 +14,22 @@ INVENTORY_PATH = Path("outputs/document_inventory.csv")
 OUTPUT_PATH = Path("outputs/page_inventory.csv")
 RENDER_ROOT = Path("Ausweiskopie/RenderedPages")
 
-# Suitable for page screening. Confirmed pages should later be rendered at
-# 300 DPI for field extraction.
+# Baseline DPI for normal A4-like pages. Confirmed pages should later be
+# rendered at 300 DPI for field extraction.
 SCREENING_DPI = 200
-RENDER_ZOOM = SCREENING_DPI / 72.0
+BASE_ZOOM = SCREENING_DPI / 72.0
+
+# Adaptive zoom targets in pixels.
+#
+# Pages containing Ausweiskopien are often not A4: a directly scanned ID
+# card produces a card-format page (~54x86 mm) that renders far too small
+# at a fixed DPI and then fails the minimum-size quality check without
+# ever reaching SecureGPT. The zoom is therefore adjusted per page:
+# - upscale so the short side reaches at least TARGET_MIN_SHORT_SIDE_PX
+# - downscale so the long side does not exceed TARGET_MAX_LONG_SIDE_PX
+# Normal A4 pages at 200 DPI (about 1654x2339 px) are unaffected.
+TARGET_MIN_SHORT_SIDE_PX = 1024
+TARGET_MAX_LONG_SIDE_PX = 2400
 
 MIN_IMAGE_WIDTH = 500
 MIN_IMAGE_HEIGHT = 500
@@ -39,6 +51,36 @@ def safe_folder_name(value: str) -> str:
     ).strip("_")
 
     return cleaned or "document"
+
+
+def compute_page_zoom(
+    page_width_pt: float,
+    page_height_pt: float,
+) -> float:
+    """
+    Compute the render zoom for one page.
+
+    Starts from the baseline screening zoom and adjusts it so the
+    rendered image has a short side of at least
+    TARGET_MIN_SHORT_SIDE_PX and a long side of at most
+    TARGET_MAX_LONG_SIDE_PX.
+    """
+    if page_width_pt <= 0 or page_height_pt <= 0:
+        return BASE_ZOOM
+
+    zoom = BASE_ZOOM
+
+    short_side_px = min(page_width_pt, page_height_pt) * zoom
+    long_side_px = max(page_width_pt, page_height_pt) * zoom
+
+    if short_side_px < TARGET_MIN_SHORT_SIDE_PX:
+        zoom *= TARGET_MIN_SHORT_SIDE_PX / short_side_px
+        long_side_px = max(page_width_pt, page_height_pt) * zoom
+
+    if long_side_px > TARGET_MAX_LONG_SIDE_PX:
+        zoom *= TARGET_MAX_LONG_SIDE_PX / long_side_px
+
+    return zoom
 
 
 def check_image_quality(
@@ -122,13 +164,20 @@ def render_pdf(
                 "pdf_order_in_masterindex": pdf_order,
                 "page_number": global_page_number,
                 "source_page_number": source_page_number,
-                "render_dpi": SCREENING_DPI,
                 "rendered_at_utc": utc_now_iso(),
             }
 
             try:
                 page = document.load_page(source_page_index)
-                matrix = fitz.Matrix(RENDER_ZOOM, RENDER_ZOOM)
+
+                page_rect = page.rect
+                zoom = compute_page_zoom(
+                    page_width_pt=page_rect.width,
+                    page_height_pt=page_rect.height,
+                )
+                effective_dpi = round(zoom * 72.0, 1)
+
+                matrix = fitz.Matrix(zoom, zoom)
                 pixmap = page.get_pixmap(matrix=matrix, alpha=False)
                 pixmap.save(str(image_path))
 
@@ -140,6 +189,9 @@ def render_pdf(
                 ) = check_image_quality(image_path)
 
                 row.update({
+                    "page_width_pt": round(page_rect.width, 2),
+                    "page_height_pt": round(page_rect.height, 2),
+                    "render_dpi": effective_dpi,
                     "image_path": str(image_path),
                     "image_sha256": sha256_file(image_path),
                     "image_width": width,
@@ -154,6 +206,9 @@ def render_pdf(
                 image_path.unlink(missing_ok=True)
 
                 row.update({
+                    "page_width_pt": None,
+                    "page_height_pt": None,
+                    "render_dpi": None,
                     "image_path": None,
                     "image_sha256": None,
                     "image_width": None,
@@ -244,8 +299,10 @@ def main() -> None:
                     "pdf_order_in_masterindex": pdf_order,
                     "page_number": None,
                     "source_page_number": None,
-                    "render_dpi": SCREENING_DPI,
                     "rendered_at_utc": utc_now_iso(),
+                    "page_width_pt": None,
+                    "page_height_pt": None,
+                    "render_dpi": None,
                     "image_path": None,
                     "image_sha256": None,
                     "image_width": None,
