@@ -309,17 +309,16 @@ def main() -> None:
     review["reviewer"] = None
     review["review_comment"] = None
 
+    # Only columns that actually exist in the screening records.
     preferred_columns = [
         "masterindex_id",
         "pdf_path_in_zip",
-        "pdf_order_in_masterindex",
         "page_number",
         "source_page_number",
         "image_path",
         "image_sha256",
         "predicted_label",
         "confidence",
-        "evidence_code",
         "evidence",
         "status",
         "error",
@@ -329,9 +328,7 @@ def main() -> None:
         "review_reason",
         "sampling_probability",
         "sampling_weight",
-        "prompt_version",
-        "model_name",
-        "model_version",
+        "model_id",
         "temperature",
         "seed",
         "reviewed_label",
@@ -348,7 +345,6 @@ def main() -> None:
         column
         for column in [
             "masterindex_id",
-            "pdf_order_in_masterindex",
             "pdf_path_in_zip",
             "page_number",
         ]
