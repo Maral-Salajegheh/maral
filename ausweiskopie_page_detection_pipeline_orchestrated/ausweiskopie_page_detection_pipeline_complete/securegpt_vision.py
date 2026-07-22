@@ -35,6 +35,16 @@ MIN_SHORT_SIDE_PX = 1024
 MAX_LONG_SIDE_PX = 2400
 JPEG_QUALITY = 92
 
+# Payload guard against the ESG gateway upload limit (error 413,
+# ESG070 "Size limit exceeded"). Images are always sent as JPEG;
+# raw PNG renders of photo-heavy pages can exceed the limit. If the
+# encoded payload is still too large, quality and then resolution
+# are stepped down until it fits. Adjust MAX_PAYLOAD_BYTES if the
+# documented ESG limit differs.
+MAX_PAYLOAD_BYTES = 4_000_000
+FALLBACK_JPEG_QUALITIES = [80, 65]
+FALLBACK_SCALE_FACTORS = [0.75, 0.5]
+
 
 class SecureGPTScreeningError(RuntimeError):
     """SecureGPT failure including the number of attempted calls."""
@@ -171,31 +181,37 @@ def validate_configuration() -> None:
         raise ValueError("SECUREGPT_MODEL_VERSION is not set.")
 
 
+def _encode_jpeg_data_url(image: Image.Image, quality: int) -> str:
+    """Encode one PIL image as a Base64 JPEG data URL."""
+    buffer = io.BytesIO()
+    image.save(buffer, format="JPEG", quality=quality)
+    encoded = base64.b64encode(buffer.getvalue()).decode("utf-8")
+    return f"data:image/jpeg;base64,{encoded}"
+
+
 def normalize_page_image(image_path: Path) -> str:
     """
     Load one page image, normalise its pixel size, and return a
-    Base64 data URL.
+    Base64 JPEG data URL that fits the ESG payload limit.
 
     - Pages whose short side is below MIN_SHORT_SIDE_PX are upscaled
       (card-format ID scans, thumbnail-sized renders).
     - Pages whose long side exceeds MAX_LONG_SIDE_PX are downscaled.
-    - Pages already within range are passed through unchanged from
-      the original file bytes.
+    - Every page is re-encoded as JPEG. Raw PNG renders of
+      photo-heavy pages can exceed the ESG upload limit
+      (error 413 / ESG070), so PNG is never sent.
+    - If the encoded payload still exceeds MAX_PAYLOAD_BYTES, the
+      JPEG quality and then the resolution are stepped down until
+      it fits.
     """
     if not image_path.exists():
         raise FileNotFoundError(f"Image not found: {image_path}")
 
-    suffix = image_path.suffix.lower()
-
-    if suffix == ".png":
-        mime_type = "image/png"
-    elif suffix in {".jpg", ".jpeg"}:
-        mime_type = "image/jpeg"
-    else:
+    if image_path.suffix.lower() not in {".png", ".jpg", ".jpeg"}:
         raise ValueError(f"Unsupported image format: {image_path.suffix}")
 
-    with Image.open(image_path) as image:
-        width, height = image.size
+    with Image.open(image_path) as source:
+        width, height = source.size
         short_side = min(width, height)
         long_side = max(width, height)
 
@@ -207,27 +223,54 @@ def normalize_page_image(image_path: Path) -> str:
         if long_side * scale > MAX_LONG_SIDE_PX:
             scale = MAX_LONG_SIDE_PX / long_side
 
-        if scale == 1.0:
-            encoded = base64.b64encode(
-                image_path.read_bytes()
-            ).decode("utf-8")
-            return f"data:{mime_type};base64,{encoded}"
+        image = source.convert("RGB")
 
-        new_size = (
-            max(1, round(width * scale)),
-            max(1, round(height * scale)),
-        )
+        if scale != 1.0:
+            new_size = (
+                max(1, round(width * scale)),
+                max(1, round(height * scale)),
+            )
+            image = image.resize(new_size, Image.LANCZOS)
 
-        resized = image.convert("RGB").resize(
-            new_size,
-            Image.LANCZOS,
-        )
+        data_url = _encode_jpeg_data_url(image, JPEG_QUALITY)
 
-        buffer = io.BytesIO()
-        resized.save(buffer, format="JPEG", quality=JPEG_QUALITY)
+        if len(data_url) <= MAX_PAYLOAD_BYTES:
+            return data_url
 
-        encoded = base64.b64encode(buffer.getvalue()).decode("utf-8")
-        return f"data:image/jpeg;base64,{encoded}"
+        # Payload guard ladder: lower quality first, then resolution.
+        for quality in FALLBACK_JPEG_QUALITIES:
+            data_url = _encode_jpeg_data_url(image, quality)
+            if len(data_url) <= MAX_PAYLOAD_BYTES:
+                print(
+                    f"Payload guard: {image_path.name} sent at "
+                    f"JPEG quality {quality}."
+                )
+                return data_url
+
+        for factor in FALLBACK_SCALE_FACTORS:
+            reduced = image.resize(
+                (
+                    max(1, round(image.width * factor)),
+                    max(1, round(image.height * factor)),
+                ),
+                Image.LANCZOS,
+            )
+            data_url = _encode_jpeg_data_url(
+                reduced,
+                FALLBACK_JPEG_QUALITIES[-1],
+            )
+            if len(data_url) <= MAX_PAYLOAD_BYTES:
+                print(
+                    f"Payload guard: {image_path.name} sent at "
+                    f"{factor:.0%} resolution, JPEG quality "
+                    f"{FALLBACK_JPEG_QUALITIES[-1]}."
+                )
+                return data_url
+
+    raise ValueError(
+        f"Image payload for {image_path} cannot be reduced below "
+        f"{MAX_PAYLOAD_BYTES} bytes."
+    )
 
 
 def create_securegpt_client() -> SecureGPT:
