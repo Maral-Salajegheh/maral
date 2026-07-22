@@ -40,49 +40,103 @@ class AusweisPageResponse(BaseModel):
         "unreadable_or_ambiguous",
     ]
 
-    confidence: float = Field(ge=0.0, le=1.0)
+    confidence: float = Field(ge=0.0, le=1.0,
+                              
+                              descriptin= ("confidence in the selectet label."
+                                            "Use a value between 0.0 and 1.0")
+                              )
+    
+    
+    class SecureGPTScreeningError(RuntimeError):
+        """SecureGPT failure including the number of attempted calls."""
+        
+        def __init__(
+             self, 
+             message: str,
+             attempts: int,
+             )-> None:
+            super().__init__(message)
+            self.attempts = attempts
 
 
 SYSTEM_PROMPT = """
-You classify one insurance-document page at a time.
+Du klassifizierst jeweils genau eine Seite eines Versicherungsdokuments.
 
-Determine whether the supplied page image contains a full or partial copy
-of a personal identity document.
+Prüfe ausschließlich das bereitgestellte Seitenbild und entscheide, ob die
+Seite vollständig oder teilweise eine Kopie eines amtlichen persönlichen
+Identitätsdokuments enthält.
 
-Use exactly one label:
+Verwende genau eines der folgenden Labels:
 
 - ausweiskopie:
-  The page visibly contains a full or partial copy, scan, photograph, front
-  side, back side, or embedded image of an identity document such as an
-  identity card, passport, or residence permit.
+  Auf der Seite ist vollständig oder teilweise eine Kopie, ein Scan, ein Foto,
+  die Vorderseite, die Rückseite oder eine eingebettete Abbildung eines
+  amtlichen Identitätsdokuments sichtbar.
+
+  Dazu gehören insbesondere:
+  - Personalausweis
+  - Reisepass
+  - Aufenthaltstitel
 
 - not_ausweiskopie:
-  The page does not visibly contain an identity-document copy.
+  Auf der Seite ist keine Kopie eines amtlichen persönlichen
+  Identitätsdokuments sichtbar.
 
 - unclear:
-  The image is unreadable, too incomplete, ambiguous, or technically
-  insufficient for a reliable decision.
+  Das Bild ist nicht ausreichend lesbar, zu unvollständig, mehrdeutig oder
+  technisch ungeeignet, sodass keine zuverlässige Entscheidung möglich ist.
 
-Rules:
+Beachte folgende Regeln:
 
-1. Inspect the image itself. Do not use SST, filenames, folder names, or
-   external metadata.
-2. A page may contain other document content and still be ausweiskopie when
-   an identity-document copy is visibly embedded in it.
-3. Do not guess.
-4. Do not transcribe names, dates of birth, addresses, document numbers,
-   MRZ text, signatures, or any other personal value.
-5. Return a confidence value between 0.0 and 1.0.
-6. Return only the requested structured response.
+1. Beurteile ausschließlich den sichtbaren Inhalt des Seitenbildes.
+   Verwende keine Dateinamen, Ordnernamen, SST-Werte oder sonstige Metadaten.
+
+2. Eine Seite kann zusätzlich andere Dokumentinhalte enthalten und trotzdem
+   als ausweiskopie klassifiziert werden, wenn darauf eine vollständige oder
+   teilweise Kopie eines Identitätsdokuments sichtbar ist.
+
+3. Auch eine teilweise sichtbare Vorder- oder Rückseite eines
+   Identitätsdokuments gilt als ausweiskopie, sofern sie eindeutig als Teil
+   eines Identitätsdokuments erkennbar ist.
+
+4. Krankenversicherungskarten, Bankkarten, Kundenkarten,
+   Mitarbeiterausweise, Führerscheine und reine Passfotos gelten nicht als
+   Ausweiskopie.
+
+5. Wenn nicht zuverlässig entschieden werden kann, verwende unclear.
+   Rate nicht.
+
+6. Gib niemals personenbezogene Inhalte wieder. Transkribiere insbesondere
+   keine Namen, Geburtsdaten, Anschriften, Dokumentennummern,
+   Unterschriften oder MRZ-Inhalte.
+
+7. Gib zusätzlich einen confidence-Wert zwischen 0.0 und 1.0 zurück:
+
+   - 0.90 bis 1.00:
+     Das Ergebnis ist visuell eindeutig.
+
+   - 0.60 bis 0.89:
+     Das Ergebnis ist wahrscheinlich, aber nicht vollständig eindeutig.
+
+   - unter 0.60:
+     Das Ergebnis ist stark unsicher und sollte manuell geprüft werden.
+
+8. Verwende bei stark unsicheren Bildern vorzugsweise das Label unclear.
+
+9. Gib ausschließlich die angeforderte strukturierte Antwort zurück.
 """.strip()
 
 
 USER_PROMPT = """
-Inspect this page image and classify it as ausweiskopie,
-not_ausweiskopie, or unclear.
+Prüfe dieses Seitenbild.
 
-Return one coarse evidence code and a confidence value between 0.0 and 1.0.
-Do not return personal information.
+Gib zurück:
+
+- label
+- evidence_code
+- confidence
+
+Gib keine personenbezogenen Informationen zurück.
 """.strip()
 
 
