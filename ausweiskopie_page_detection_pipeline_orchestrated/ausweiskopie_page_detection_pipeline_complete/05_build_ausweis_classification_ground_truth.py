@@ -317,9 +317,10 @@ def main() -> None:
                     "confidence",
                 )
             ),
+            # The review workbook column is named "status".
             "screening_status": optional_value(
                 row,
-                "screening_status",
+                "status",
             ),
             "is_ausweiskopie_gt": (
                 ground_truth_label
