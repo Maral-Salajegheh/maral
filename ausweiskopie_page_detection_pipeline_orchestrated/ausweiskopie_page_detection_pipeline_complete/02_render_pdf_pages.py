@@ -238,7 +238,7 @@ def main() -> None:
     ].copy()
 
     ready_inventory["pdf_order_in_masterindex"] = (
-        ready_inventory["pdf_order_in_masterindex"].astype(int)
+        ready_inventory["pdf_order_in_masterindex"].astype(float).astype(int)
     )
 
     ready_inventory = ready_inventory.sort_values(
