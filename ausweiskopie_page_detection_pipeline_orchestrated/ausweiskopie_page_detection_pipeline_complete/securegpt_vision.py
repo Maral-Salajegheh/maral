@@ -32,7 +32,7 @@ RETRY_DELAYS_SECONDS = [1, 2, 4, 8]
 # aggressively downsampled by the API. Both cases are normalised
 # here before the image is sent.
 MIN_SHORT_SIDE_PX = 1024
-MAX_LONG_SIDE_PX = 2200
+MAX_LONG_SIDE_PX = 2400
 JPEG_QUALITY = 92
 
 
@@ -274,6 +274,106 @@ def is_retryable_securegpt_error(error: Exception) -> bool:
     return any(marker in error_text for marker in retryable_markers)
 
 
+# Call modes, tried in order. The first mode the installed wrapper
+# accepts is cached for the whole run, so incompatible keyword
+# arguments (image_detail, response_model) are probed exactly once
+# instead of failing every page.
+_CALL_MODES = [
+    "full",           # image_detail + response_model
+    "no_detail",      # response_model only
+    "json_fallback",  # plain call, strict JSON parsed locally
+]
+
+_active_call_mode: str | None = None
+
+_JSON_FALLBACK_SUFFIX = (
+    "\nGib ausschließlich gültiges JSON mit genau diesen "
+    'Schlüsseln zurück: {"label": "...", '
+    '"evidence_code": "...", "confidence": 0.0}'
+)
+
+
+def _call_securegpt(
+    client: SecureGPT,
+    image_data_url: str,
+) -> AusweisPageResponse:
+    """
+    Call new_chat with the first call mode the wrapper supports.
+
+    A TypeError from an unsupported keyword argument moves to the
+    next mode. The working mode is cached in _active_call_mode.
+    """
+    global _active_call_mode
+
+    modes = (
+        [_active_call_mode]
+        if _active_call_mode is not None
+        else _CALL_MODES
+    )
+
+    last_type_error: TypeError | None = None
+
+    for mode in modes:
+        try:
+            if mode == "full":
+                response = client.new_chat(
+                    system_prompt=SYSTEM_PROMPT,
+                    user_prompt=USER_PROMPT,
+                    user_image=image_data_url,
+                    image_detail="high",
+                    response_model=AusweisPageResponse,
+                )
+            elif mode == "no_detail":
+                response = client.new_chat(
+                    system_prompt=SYSTEM_PROMPT,
+                    user_prompt=USER_PROMPT,
+                    user_image=image_data_url,
+                    response_model=AusweisPageResponse,
+                )
+            else:
+                response = client.new_chat(
+                    system_prompt=SYSTEM_PROMPT,
+                    user_prompt=(
+                        USER_PROMPT + _JSON_FALLBACK_SUFFIX
+                    ),
+                    user_image=image_data_url,
+                )
+
+        except TypeError as error:
+            if _active_call_mode is not None:
+                # The cached mode worked before; this TypeError
+                # is a real bug, not a signature mismatch.
+                raise
+
+            last_type_error = error
+            continue
+
+        if _active_call_mode is None:
+            _active_call_mode = mode
+            print(f"SecureGPT call mode: {mode}")
+
+        answer = (
+            response.answer
+            if hasattr(response, "answer")
+            else response
+        )
+
+        if isinstance(answer, AusweisPageResponse):
+            return answer
+
+        if isinstance(answer, str):
+            return AusweisPageResponse.model_validate_json(
+                answer
+            )
+
+        return AusweisPageResponse.model_validate(answer)
+
+    raise TypeError(
+        "No supported new_chat signature found. "
+        f"Last TypeError: {last_type_error}"
+    ) from last_type_error
+
+
 def screen_image(
     client: SecureGPT,
     image_path: Path,
@@ -293,18 +393,10 @@ def screen_image(
         attempt_number = attempt_index + 1
 
         try:
-            response = client.new_chat(
-                system_prompt=SYSTEM_PROMPT,
-                user_prompt=USER_PROMPT,
-                user_image=image_data_url,
-                image_detail="high",
-                response_model=AusweisPageResponse,
+            parsed = _call_securegpt(
+                client=client,
+                image_data_url=image_data_url,
             )
-
-            parsed = response.answer
-
-            if not isinstance(parsed, AusweisPageResponse):
-                parsed = AusweisPageResponse.model_validate(parsed)
 
             return {
                 "label": parsed.label,
