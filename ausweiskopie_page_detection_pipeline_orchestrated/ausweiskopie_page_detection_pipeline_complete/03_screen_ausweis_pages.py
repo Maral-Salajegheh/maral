@@ -47,8 +47,8 @@ def inventory_page_records(
         records.append({
             "masterindex_id": str(row["masterindex_id"]),
             "pdf_path_in_zip": str(row["pdf_path_in_zip"]),
-            "page_number": int(row["page_number"]),
-            "source_page_number": int(row["source_page_number"]),
+            "page_number": int(float(row["page_number"])),
+            "source_page_number": int(float(row["source_page_number"])),
             "image_path": (
                 None
                 if pd.isna(row.get("image_path"))
