@@ -56,7 +56,7 @@ def read_current_screening_results() -> pd.DataFrame:
                 row["pdf_path_in_zip"]
             ),
             "source_page_number": int(
-                row["source_page_number"]
+                float(row["source_page_number"])
             ),
             "image_sha256": (
                 None
