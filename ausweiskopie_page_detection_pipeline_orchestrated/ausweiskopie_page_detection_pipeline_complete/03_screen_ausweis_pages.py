@@ -12,7 +12,7 @@ from pipeline_utils import (
     utc_now_iso,
 )
 from securegpt_vision import (
-    MODEL,
+    MODEL_NAME,
     SEED,
     TEMPERATURE,
     SecureGPTScreeningError,
@@ -21,13 +21,9 @@ from securegpt_vision import (
 )
 
 
-PAGE_INVENTORY_PATH = Path(
-    "outputs/page_inventory.csv"
-)
+PAGE_INVENTORY_PATH = Path("outputs/page_inventory.csv")
 
-PAGE_RESULTS_PATH = Path(
-    "outputs/ausweis_page_screening.jsonl"
-)
+PAGE_RESULTS_PATH = Path("outputs/ausweis_page_screening.jsonl")
 
 HUMAN_REVIEW_THRESHOLD = 0.60
 
@@ -35,7 +31,13 @@ HUMAN_REVIEW_THRESHOLD = 0.60
 def inventory_page_records(
     page_inventory: pd.DataFrame,
 ) -> list[dict[str, Any]]:
-    """Convert usable inventory rows to page records."""
+    """
+    Convert usable inventory rows to page records.
+
+    source_page_number and image_sha256 must be carried along:
+    page_record_key builds the resume/dedup key from them, and
+    04_prepare_detection_review.py matches results on the same key.
+    """
     records: list[dict[str, Any]] = []
 
     for _, row in page_inventory.iterrows():
@@ -43,26 +45,22 @@ def inventory_page_records(
             continue
 
         records.append({
-            "masterindex_id": str(
-                row["masterindex_id"]
-            ),
-            "pdf_path_in_zip": str(
-                row["pdf_path_in_zip"]
-            ),
-            "page_number": int(
-                row["page_number"]
-            ),
+            "masterindex_id": str(row["masterindex_id"]),
+            "pdf_path_in_zip": str(row["pdf_path_in_zip"]),
+            "page_number": int(row["page_number"]),
+            "source_page_number": int(row["source_page_number"]),
             "image_path": (
                 None
                 if pd.isna(row.get("image_path"))
                 else str(row["image_path"])
             ),
-            "render_status": str(
-                row["render_status"]
+            "image_sha256": (
+                None
+                if pd.isna(row.get("image_sha256"))
+                else str(row["image_sha256"])
             ),
-            "quality_status": str(
-                row["quality_status"]
-            ),
+            "render_status": str(row["render_status"]),
+            "quality_status": str(row["quality_status"]),
         })
 
     return records
@@ -89,8 +87,7 @@ def needs_human_review(
 def main() -> None:
     if not PAGE_INVENTORY_PATH.exists():
         raise FileNotFoundError(
-            f"Page inventory not found: "
-            f"{PAGE_INVENTORY_PATH}"
+            f"Page inventory not found: {PAGE_INVENTORY_PATH}"
         )
 
     page_inventory = pd.read_csv(
@@ -98,9 +95,7 @@ def main() -> None:
         dtype=object,
     )
 
-    pages = inventory_page_records(
-        page_inventory
-    )
+    pages = inventory_page_records(page_inventory)
 
     latest_results = read_latest_jsonl(
         PAGE_RESULTS_PATH,
@@ -120,10 +115,7 @@ def main() -> None:
         existing = latest_results.get(key)
 
         # Successful results are not sent again.
-        if (
-            existing
-            and existing.get("status") == "success"
-        ):
+        if existing and existing.get("status") == "success":
             continue
 
         if page["render_status"] != "success":
@@ -133,7 +125,7 @@ def main() -> None:
                 "evidence": "technical_render_failure",
                 "confidence": None,
                 "needs_human_review": True,
-                "model_id": MODEL,
+                "model_id": MODEL_NAME,
                 "temperature": TEMPERATURE,
                 "seed": SEED,
                 "attempt_count": 0,
@@ -150,7 +142,7 @@ def main() -> None:
                 "evidence": "technical_quality_issue",
                 "confidence": None,
                 "needs_human_review": True,
-                "model_id": MODEL,
+                "model_id": MODEL_NAME,
                 "temperature": TEMPERATURE,
                 "seed": SEED,
                 "attempt_count": 0,
@@ -167,39 +159,27 @@ def main() -> None:
             try:
                 result = screen_image(
                     client=client,
-                    image_path=Path(
-                        str(page["image_path"])
-                    ),
+                    image_path=Path(str(page["image_path"])),
                 )
 
                 label = str(result["label"])
-                confidence = float(
-                    result["confidence"]
-                )
+                confidence = float(result["confidence"])
 
                 record = {
                     **page,
                     "label": label,
-                    "evidence": str(
-                        result["evidence_code"]
-                    ),
+                    "evidence": str(result["evidence_code"]),
                     "confidence": confidence,
-                    "needs_human_review": (
-                        needs_human_review(
-                            label=label,
-                            confidence=confidence,
-                            status="success",
-                        )
+                    "needs_human_review": needs_human_review(
+                        label=label,
+                        confidence=confidence,
+                        status="success",
                     ),
-                    "model_id": MODEL,
+                    "model_id": MODEL_NAME,
                     "temperature": TEMPERATURE,
                     "seed": SEED,
-                    "attempt_count": int(
-                        result["attempt_count"]
-                    ),
-                    "retry_count": int(
-                        result["retry_count"]
-                    ),
+                    "attempt_count": int(result["attempt_count"]),
+                    "retry_count": int(result["retry_count"]),
                     "processed_at_utc": utc_now_iso(),
                     "status": "success",
                     "error": None,
@@ -209,19 +189,14 @@ def main() -> None:
                 record = {
                     **page,
                     "label": "unclear",
-                    "evidence": (
-                        "technical_securegpt_failure"
-                    ),
+                    "evidence": "technical_securegpt_failure",
                     "confidence": None,
                     "needs_human_review": True,
-                    "model_id": MODEL,
+                    "model_id": MODEL_NAME,
                     "temperature": TEMPERATURE,
                     "seed": SEED,
                     "attempt_count": error.attempts,
-                    "retry_count": max(
-                        error.attempts - 1,
-                        0,
-                    ),
+                    "retry_count": max(error.attempts - 1, 0),
                     "processed_at_utc": utc_now_iso(),
                     "status": "failed",
                     "error": str(error),
@@ -231,12 +206,10 @@ def main() -> None:
                 record = {
                     **page,
                     "label": "unclear",
-                    "evidence": (
-                        "unexpected_screening_failure"
-                    ),
+                    "evidence": "unexpected_screening_failure",
                     "confidence": None,
                     "needs_human_review": True,
-                    "model_id": MODEL_ID,
+                    "model_id": MODEL_NAME,
                     "temperature": TEMPERATURE,
                     "seed": SEED,
                     "attempt_count": 1,
@@ -246,10 +219,7 @@ def main() -> None:
                     "error": str(error),
                 }
 
-        append_jsonl(
-            PAGE_RESULTS_PATH,
-            record,
-        )
+        append_jsonl(PAGE_RESULTS_PATH, record)
 
         latest_results[key] = record
 
@@ -261,9 +231,7 @@ def main() -> None:
             f"status={record['status']}"
         )
 
-    print(
-        f"Results written to: {PAGE_RESULTS_PATH}"
-    )
+    print(f"Results written to: {PAGE_RESULTS_PATH}")
 
 
 if __name__ == "__main__":
