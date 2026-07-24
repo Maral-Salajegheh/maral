@@ -23,8 +23,17 @@ OUTPUT_PATH = Path(
 
 # Small audit samples are required so Ground Truth does not contain
 # only difficult or uncertain pages.
+#
+# The audit sample is a percentage of auto-accepted pages, but with
+# an absolute floor and an absolute cap. Statistical confidence
+# depends on the absolute number of audited pages, not on the
+# fraction: about 400 pages per label bounds the precision estimate
+# to roughly +/- 2 percentage points regardless of corpus size, so
+# sampling more than that at 200k+ files would multiply human
+# effort without improving the estimate.
 AUDIT_FRACTION = 0.05
 AUDIT_MIN_PAGES_PER_LABEL = 20
+AUDIT_MAX_PAGES_PER_LABEL = 400
 RANDOM_SEED = 42
 
 
@@ -116,6 +125,7 @@ def choose_audit_sample(
 
     sample_size = min(
         sample_size,
+        AUDIT_MAX_PAGES_PER_LABEL,
         len(pages),
     )
 
