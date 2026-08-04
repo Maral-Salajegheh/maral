@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Literal
 
 from PIL import Image
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, Field, ValidationError, model_validator
 
 from axallm.securegpt.v2.providers import OpenAIProvider
 from axallm.securegpt.v2.securegpt import SecureGPT
@@ -79,7 +79,32 @@ class AusweisPageResponse(BaseModel):
             "Use a value between 0.0 and 1.0."
         ),
     )
-
+    
+    @model_validator (mode="after")
+    def validate_consistency(self):
+        positive_evidence = {
+        "id_card_layout",
+        "passport_layout",
+        "portrait_and_id_layout",
+        "mrz_like_area",
+        "multiple_id_sides",           
+        }
+        if self.label == "ausweiskopie" and self.evidence_code not in positive_evidence:
+            raise ValidationError(
+                f"Label 'ausweiskopie' requires a positive evidence. "
+            )
+            
+        if self.label == "not_ausweiskopie" and self.evidence_code != "no_id_features":
+            raise ValidationError(
+                f"Label 'not_ausweiskopie' requires no id_featurs. "
+            )
+            
+        if self.label == "unclear" and self.evidence_code != "unreadble_or_ambiguous":
+            raise ValidationError(
+                f"Label 'unclear' requires unreadble_or_ambiguous. "
+            )   
+            
+        return self                      
 
 SYSTEM_PROMPT = """
 Du klassifizierst jeweils genau eine Seite eines Versicherungsdokuments.
