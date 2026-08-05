@@ -9,6 +9,11 @@ AWS_REGION = os.getenv("AWS_REGION", "eu-central-1")
 PROJECT_BUCKET = os.getenv("PROJECT_BUCKET", "ap-mlops-life-ai")
 CORPUS_ROOT_PREFIX = os.getenv("CORPUS_ROOT_PREFIX", "data/document_corpus").strip("/")
 LOCAL_TEMP_ROOT = Path(os.getenv("LOCAL_TEMP_ROOT", "/tmp/life-document-ai"))
+# Default location of incoming Life Prod export ZIPs. A bare filename given on
+# the command line is resolved against this prefix.
+SOURCE_ZIP_PREFIX = os.getenv(
+    "SOURCE_ZIP_PREFIX", "s3://itecmcm-prod-prod-flexporter-life-prod/02_OUT"
+).rstrip("/")
 
 ALLOWED_EXTENSIONS = {".pdf", ".csv"}
 MAX_ZIP_MEMBERS = int(os.getenv("MAX_ZIP_MEMBERS", "500000"))

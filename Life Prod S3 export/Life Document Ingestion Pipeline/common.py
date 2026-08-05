@@ -55,6 +55,13 @@ def parse_s3_uri(uri: str) -> tuple[str, str]:
     return bucket, key
 
 
+def resolve_source_uri(name_or_uri: str, source_prefix: str) -> str:
+    """Full s3:// URI from a bare ZIP filename, or pass through a full URI."""
+    if name_or_uri.startswith("s3://"):
+        return name_or_uri
+    return f"{source_prefix}/{name_or_uri.lstrip('/')}"
+
+
 def sha256_file(path: Path, chunk_size: int = 1024 * 1024) -> str:
     """SHA-256 of a file, streamed in chunks."""
     digest = hashlib.sha256()

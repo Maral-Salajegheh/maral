@@ -2,8 +2,8 @@
 the first failure. Writes run_summary.json locally and to S3.
 
 Examples:
-    # New batch: batch_id is derived from date and ZIP filename
-    python run_pipeline.py --source-s3-uri s3://life-prod-02-out/export.zip
+    # New batch: just the ZIP filename (resolved against SOURCE_ZIP_PREFIX)
+    python run_pipeline.py --source-s3-uri export.zip
 
     # Re-run part of an existing batch: name it explicitly
     python run_pipeline.py --batch-id life_20260804_export --from-stage 04
@@ -18,8 +18,20 @@ from pathlib import Path
 
 import boto3
 
-from common import atomic_write_json, build_batch_id, utc_now_iso, validate_batch_id
-from config import AWS_REGION, CORPUS_ROOT_PREFIX, LOCAL_TEMP_ROOT, PROJECT_BUCKET
+from common import (
+    atomic_write_json,
+    build_batch_id,
+    resolve_source_uri,
+    utc_now_iso,
+    validate_batch_id,
+)
+from config import (
+    AWS_REGION,
+    CORPUS_ROOT_PREFIX,
+    LOCAL_TEMP_ROOT,
+    PROJECT_BUCKET,
+    SOURCE_ZIP_PREFIX,
+)
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 STAGES = [
@@ -42,7 +54,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optional; derived from date and ZIP filename when omitted.",
     )
     parser.add_argument(
-        "--source-s3-uri", default=None, help="Required when stage 01 runs."
+        "--source-s3-uri",
+        default=None,
+        help="ZIP filename (resolved against SOURCE_ZIP_PREFIX) or a full s3:// URI. Required when stage 01 runs.",
     )
     parser.add_argument("--from-stage", choices=STAGE_NUMBERS, default="01")
     parser.add_argument("--to-stage", choices=STAGE_NUMBERS, default="04")
@@ -121,6 +135,8 @@ def upload_summary(summary_path: Path, batch_id: str) -> None:
 def main() -> None:
     """Run the selected stages and write the run summary."""
     args = build_parser().parse_args()
+    if args.source_s3_uri:
+        args.source_s3_uri = resolve_source_uri(args.source_s3_uri, SOURCE_ZIP_PREFIX)
     selected = select_stages(args)
     batch_id = resolve_batch_id(args)
     args.batch_id = batch_id
