@@ -52,8 +52,8 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="ZIP filename (resolved against SOURCE_ZIP_PREFIX) or a full s3:// URI. Required when stage 01 runs.",
     )
-    parser.add_argument("--from-stage", choices=STAGE_NUMBERS, default="01")
-    parser.add_argument("--to-stage", choices=STAGE_NUMBERS, default="04")
+    parser.add_argument("--from-stage", choices=STAGE_NUMBERS, default=STAGE_NUMBERS[0])
+    parser.add_argument("--to-stage", choices=STAGE_NUMBERS, default=STAGE_NUMBERS[-1])
     parser.add_argument(
         "--extra-args-03", default="", help="Extra arguments for stage 03 (render)."
     )
