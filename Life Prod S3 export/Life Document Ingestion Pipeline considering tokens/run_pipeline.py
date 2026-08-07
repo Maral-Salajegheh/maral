@@ -17,7 +17,6 @@ import sys
 import time
 from pathlib import Path
 
-import boto3
 
 from common import (
     atomic_write_json,
@@ -26,13 +25,7 @@ from common import (
     utc_now_iso,
     validate_batch_id,
 )
-from config import (
-    AWS_REGION,
-    CORPUS_ROOT_PREFIX,
-    LOCAL_TEMP_ROOT,
-    PROJECT_BUCKET,
-    SOURCE_ZIP_PREFIX,
-)
+from config import LOCAL_TEMP_ROOT, SOURCE_ZIP_PREFIX
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 STAGES = [
@@ -119,20 +112,6 @@ def run_stage(number: str, script: str, args: argparse.Namespace) -> dict:
     }
 
 
-def upload_summary(summary_path: Path, batch_id: str) -> None:
-    """Upload run_summary.json to S3; failure to upload is only a warning."""
-    try:
-        s3_client = boto3.client("s3", region_name=AWS_REGION)
-        s3_client.upload_file(
-            str(summary_path),
-            PROJECT_BUCKET,
-            f"{CORPUS_ROOT_PREFIX}/manifests/{batch_id}/run_summary.json",
-            ExtraArgs={"ContentType": "application/json"},
-        )
-    except Exception as error:
-        print(f"Warning: could not upload run summary to S3: {error}")
-
-
 def main() -> None:
     """Run the selected stages and write the run summary."""
     args = build_parser().parse_args()
@@ -172,7 +151,6 @@ def main() -> None:
     summary["status"] = "success" if overall_success else "failed"
     summary["finished_at_utc"] = utc_now_iso()
     atomic_write_json(summary_path, summary)
-    upload_summary(summary_path, batch_id)
 
     print(f"\nRun summary: {summary_path}")
     print(f"Overall status: {summary['status']}")
