@@ -62,6 +62,8 @@ re-runs are safe.
 ### Common variations
 
 ```bash
+# to see the batch file add this command aws s3 ls s3://ap-mlops-life-ai/life_prod_raw_data/ there you will see the name of the files 
+# how to see the raw files aws s3 ls s3://itecmcm-prod-prod-flexporter-life-prod/02_OUT/
 # Re-run only rendering (e.g. after fixing an error), naming the batch explicitly
 python run_pipeline.py --batch-id life_20260810_Leben_2026_08_10 --from-stage 04
 
