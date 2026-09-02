@@ -86,7 +86,7 @@ def repair_filler_zones(lines: list[str], fmt: str) -> list[str]:
         if line_index >= len(repaired):
             continue
         zone = repaired[line_index][start:end]
-        if len(zone) >= 4 and zone.count("<") / len(zone) >= 0.6:
+        if len(zone) >= 4 and zone.count("<") / len(zone) >= 0.5:
             repaired[line_index][start:end] = ["<"] * len(zone)
     return ["".join(line) for line in repaired]
 

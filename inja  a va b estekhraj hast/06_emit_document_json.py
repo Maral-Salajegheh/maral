@@ -62,6 +62,21 @@ def resolve_page_roles(rows: list[dict[str, Any]]) -> None:
             elif carrier is not None and page.get("failure_stage") == "01_detect":
                 page.update({"status": "no_mrz_on_page", "failure_stage": "", "needs_human_review": False,
                              "error": f"No MRZ on this page; document MRZ read from page {carrier.get('page_number')}"})
+        merge_printed_fields(pages, carrier)
+
+
+# Geburtsort is printed on the card front and ausstellende Behoerde on the back, so the
+# two required fields arrive on different pages. Fill each from whichever page found it.
+def merge_printed_fields(pages: list[dict[str, Any]], carrier: dict[str, Any] | None) -> None:
+    if carrier is None:
+        return
+    for field in ("geburtsort", "ausstellende_behoerde"):
+        if carrier.get(field):
+            continue
+        donor = next((page for page in pages if page is not carrier and page.get(field)), None)
+        if donor is not None:
+            carrier[field] = donor[field]
+            carrier[f"source_{field}"] = f"{donor.get('source_geburtsort') or 'field_unknown'}_page_{donor.get('page_number')}"
 
 
 # The last stage that produced a usable result, so a blank row says which step to look at.

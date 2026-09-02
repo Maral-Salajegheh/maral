@@ -8,6 +8,7 @@ import numpy as np
 from PIL import Image, ImageDraw
 
 from Life.Extraction import config
+from Life.Extraction.mrz_morph import morphological_candidates
 from Life.Extraction.mrz_utils import normalize_line
 from Life.Extraction.utils import append_jsonl, int_value, load_page_metadata, merge_boxes_into_lines, ocr_boxes, page_key, read_csv, read_latest_jsonl, resolve_image_path, utc_now_iso, write_csv
 
@@ -101,13 +102,32 @@ def band_candidates(lines: list[dict[str, Any]], width: int, height: int) -> lis
     return sorted(candidates, key=lambda item: (item["line_count"], item["score"]), reverse=True)
 
 
+# Morphology proposes bands from texture alone; OCR then confirms the crop really reads
+# as MRZ. This finds bands the OCR-first detector misses, because it does not need to
+# recognize the characters in order to notice the band.
+def verified_morph_band(page: Image.Image) -> dict[str, Any] | None:
+    for candidate in morphological_candidates(page)[: config.MRZ_MORPH_MAX_CANDIDATES]:
+        crop = page.crop((candidate["x0"], candidate["y0"], candidate["x1"], candidate["y1"]))
+        lines = merge_boxes_into_lines(ocr_boxes(crop))
+        scores = [line_score(line["text"]) for line in lines]
+        confirmed = [score for score in scores if score > 0]
+        if len(confirmed) < 2:
+            continue
+        score = sum(confirmed) / len(confirmed)
+        if score >= config.MRZ_MIN_GROUP_SCORE:
+            return {**candidate, "score": round(score, 3), "line_count": len(confirmed),
+                    "mrz_detector_text": "\n".join(line["text"] for line in lines)}
+    return None
+
+
 # Locate the MRZ band, trying page rotations until one scores well enough.
 def detect_mrz_band(image_path: Path) -> tuple[Image.Image, Image.Image, dict[str, Any]]:
     source = Image.open(image_path).convert("RGB")
     best: tuple[Image.Image, dict[str, Any]] | None = None
     for angle in (0, 90, 180, 270):
         rotated = source.rotate(angle, expand=True) if angle else source
-        candidates = band_candidates(merge_boxes_into_lines(ocr_boxes(rotated)), rotated.width, rotated.height)
+        morph = verified_morph_band(rotated)
+        candidates = [morph] if morph else band_candidates(merge_boxes_into_lines(ocr_boxes(rotated)), rotated.width, rotated.height)
         rank = (candidates[0]["line_count"], candidates[0]["score"]) if candidates else None
         if rank and (best is None or rank > (best[1]["line_count"], best[1]["score"])):
             best = (rotated, {**candidates[0], "rotation_degrees": angle})
@@ -117,7 +137,7 @@ def detect_mrz_band(image_path: Path) -> tuple[Image.Image, Image.Image, dict[st
         raise ValueError("No MRZ-like line band detected on any rotation")
     page, meta = best
     crop = page.crop((meta["x0"], meta["y0"], meta["x1"], meta["y1"]))
-    return page, crop, {**meta, "detector": "rapidocr_lines", "detector_version": config.MRZ_DETECTOR_VERSION}
+    return page, crop, {"detector": "rapidocr_lines", **meta, "detector_version": config.MRZ_DETECTOR_VERSION}
 
 
 # Save the page with the chosen band outlined, so a failure can be inspected visually.

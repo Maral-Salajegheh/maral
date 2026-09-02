@@ -62,6 +62,11 @@ MRZ_TARGET_LINE_HEIGHT = 48
 MRZ_MAX_UPSCALE = 4.0
 MRZ_CROP_BORDER = 40
 
+# Morphological detector: all kernel sizes assume the page is resized to this width.
+MRZ_WORK_WIDTH = 900
+MRZ_MORPH_MIN_SCORE = 1.60
+MRZ_MORPH_MAX_CANDIDATES = 4
+
 # Glyphs RapidOCR returns in place of the MRZ filler character. Substituted, never deleted.
 MRZ_CHAR_FIXES = {
     ">": "<", "«": "<", "»": "<", "‹": "<", "›": "<", "^": "<", "~": "<",

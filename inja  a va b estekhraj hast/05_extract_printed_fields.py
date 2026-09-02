@@ -31,6 +31,8 @@ class PrintedFieldResponse(BaseModel):
     given_names: str | None = None
 
 
+# On an MRZ page, the printed fields sit above the band. On a page with no MRZ
+# (the card front, which carries Geburtsort) the whole page is the field zone.
 def crop_printed_field_zone(record: dict[str, Any]) -> Path:
     image = Image.open(record["resolved_image_path"]).convert("RGB")
     width, height = image.size
@@ -38,9 +40,12 @@ def crop_printed_field_zone(record: dict[str, Any]) -> Path:
     if rotation:
         image = image.rotate(rotation, expand=True)
         width, height = image.size
-    y1 = int(record.get("y0") or height * 0.75)
-    if y1 <= height * 0.25:
-        y1 = int(height * 0.75)
+    if not record.get("mrz_crop_path"):
+        y1 = height
+    else:
+        y1 = int(record.get("y0") or height * 0.75)
+        if y1 <= height * 0.25:
+            y1 = int(height * 0.75)
     crop = image.crop((0, 0, width, max(y1, 1)))
     out_path = config.FIELD_CROP_DIR / f"{record.get('image_sha256') or record['masterindex_id']}_{record['page_number']}_fields.png"
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -177,6 +182,9 @@ def main() -> None:
     args = parser.parse_args()
     records = read_latest_jsonl(args.input, page_key)
     done = read_latest_jsonl(args.output, page_key)
+    # A document's other page still needs field extraction: Geburtsort is printed on the
+    # card front, which has no MRZ and therefore never reaches this stage as a success.
+    with_mrz = {str(record.get("masterindex_id")) for record in records.values() if record.get("checks_valid")}
     for key, record in sorted(records.items()):
         previous = done.get(key)
         if (
@@ -189,7 +197,8 @@ def main() -> None:
             and previous.get("detector_version") == record.get("detector_version")
         ):
             continue
-        if record.get("status") != "success":
+        companion = str(record.get("masterindex_id")) in with_mrz
+        if record.get("status") != "success" and not companion:
             append_jsonl(args.output, {**record, "status": "failed", "needs_human_review": True, "error": record.get("error") or "Ausweistyp mapping failed", "processed_at_utc": utc_now_iso()})
             continue
         try:
@@ -207,7 +216,9 @@ def main() -> None:
                 errors.append(f"Only {found[0]} found on this page; the other field is likely on the reverse side")
             if cross_check["name_cross_check_mismatch"]:
                 errors.append("Printed names disagree with checksum-valid MRZ names")
-            output = {**record, **extracted, **cross_check, "field_crop_path": str(crop_path), "status": "success", "needs_human_review": needs_review, "error": "; ".join(errors),
+            output = {**record, **extracted, **cross_check, "field_crop_path": str(crop_path),
+                      "field_zone": "mrz_page" if record.get("mrz_crop_path") else "companion_page",
+                      "status": "success", "needs_human_review": needs_review, "error": "; ".join(errors),
                       "processed_at_utc": utc_now_iso()}
         except Exception as error:
             output = {**record, "field_extraction_source": f"field_{args.backend}", "field_extraction_backend": args.backend, "field_ocr_stage_version": config.FIELD_OCR_STAGE_VERSION, "geburtsort": None, "ausstellende_behoerde": None,
