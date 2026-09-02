@@ -43,8 +43,25 @@ CSV_FIELDS = [
     "needs_human_review",
     "status",
     "failure_stage",
+    "mrz_ocr_text",
     "error",
 ]
+
+
+# A page with no MRZ band is not a failure: the front of a Personalausweis carries none.
+# Only call it a failure if no page of the same document produced a valid MRZ either.
+def resolve_page_roles(rows: list[dict[str, Any]]) -> None:
+    by_document: dict[Any, list[dict[str, Any]]] = {}
+    for row in rows:
+        by_document.setdefault(row.get("masterindex_id"), []).append(row)
+    for pages in by_document.values():
+        carrier = next((page for page in pages if page.get("mrz_checksum_passed")), None)
+        for page in pages:
+            if page.get("mrz_checksum_passed"):
+                page["failure_stage"] = page["failure_stage"] if page.get("status") != "success" else ""
+            elif carrier is not None and page.get("failure_stage") == "01_detect":
+                page.update({"status": "no_mrz_on_page", "failure_stage": "", "needs_human_review": False,
+                             "error": f"No MRZ on this page; document MRZ read from page {carrier.get('page_number')}"})
 
 
 # The last stage that produced a usable result, so a blank row says which step to look at.
@@ -159,6 +176,7 @@ def build_csv_row(payload: dict[str, Any]) -> dict[str, Any]:
         "needs_human_review": payload.get("needs_human_review"),
         "status": payload.get("status"),
         "failure_stage": payload.get("failure_stage"),
+        "mrz_ocr_text": " | ".join(str(payload.get("mrz_ocr_text") or "").splitlines()),
         "error": payload.get("error"),
     }
 
@@ -189,6 +207,7 @@ def main() -> None:
         out_path = args.output_dir / (f"{mid}_page_{page_number}_{suffix}.json" if suffix else f"{mid}_page_{page_number}.json")
         out_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2, default=str) + "\n", encoding="utf-8")
         csv_rows.append(build_csv_row(payload))
+    resolve_page_roles(csv_rows)
     write_flat_csv(args.csv_output, csv_rows)
     print(f"Wrote document JSON files: {args.output_dir}")
     print(f"Wrote flat document CSV: {args.csv_output}")

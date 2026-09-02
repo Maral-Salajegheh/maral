@@ -85,7 +85,9 @@ def band_candidates(lines: list[dict[str, Any]], width: int, height: int) -> lis
             if score < config.MRZ_MIN_GROUP_SCORE:
                 continue
             pad_x = max(12, int(width * 0.01))
-            pad_y = max(8, int(median_height * 0.6))
+            # Generous vertical margin: if one MRZ line scored too low to join the band,
+            # it still lands inside the crop and stage 02 can recover it.
+            pad_y = max(12, int(median_height * 1.6))
             candidates.append({
                 "x0": max(0, int(min(line["x0"] for line in group)) - pad_x),
                 "y0": max(0, int(min(line["y0"] for line in group)) - pad_y),

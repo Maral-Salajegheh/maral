@@ -70,47 +70,52 @@ def fit_line(line: str, width: int) -> tuple[str, int]:
     return line.ljust(width, "<"), len(line) - width
 
 
-# A run of four or more characters that is mostly filler is filler; rewrite it whole.
-# Check-digit positions are protected, since one can legitimately sit at the end of such a run.
-def repair_filler_runs(line: str, protected: set[int]) -> str:
-    chars = list(line)
-    start = 0
-    while start < len(chars):
-        end = start
-        while end < len(chars) and (chars[end] == "<" or (end - start) < 40):
-            if chars[end] == "<":
-                end += 1
-                continue
-            window = chars[start : end + 1]
-            if window.count("<") / len(window) < 0.6:
-                break
-            end += 1
-        run = chars[start:end]
-        if len(run) >= 4 and run.count("<") / len(run) >= 0.6:
-            for index in range(start, end):
-                if index not in protected:
-                    chars[index] = "<"
-        start = max(end, start + 1)
-    return "".join(chars)
+# Zones the format defines as optional data, where a mostly-filler reading is filler.
+# Bounding the repair to these ranges keeps it from ever rewriting a real data field.
+FILLER_ZONES = {
+    "TD1": [(0, 15, 30), (1, 18, 29)],
+    "TD2": [(1, 28, 35)],
+    "TD3": [(1, 28, 42)],
+}
 
 
-# One candidate per MRZ format whose line count and widths the OCR text could plausibly match.
+# Rewrite an optional-data zone to pure filler when it already reads as mostly filler.
+def repair_filler_zones(lines: list[str], fmt: str) -> list[str]:
+    repaired = [list(line) for line in lines]
+    for line_index, start, end in FILLER_ZONES[fmt]:
+        if line_index >= len(repaired):
+            continue
+        zone = repaired[line_index][start:end]
+        if len(zone) >= 4 and zone.count("<") / len(zone) >= 0.6:
+            repaired[line_index][start:end] = ["<"] * len(zone)
+    return ["".join(line) for line in repaired]
+
+
+# One candidate per MRZ format and per consecutive window of lines. Sliding rather than
+# taking the last N matters: OCR often picks up a stray line above or below the band.
 def candidate_variants(lines: list[str]) -> list[dict[str, Any]]:
     variants = []
     for name, (count, width) in FORMATS.items():
-        if len(lines) < count:
+        for start in range(len(lines) - count + 1):
+            variants.extend(build_variants(name, width, lines[start : start + count]))
+    return sorted(variants, key=lambda item: item["width_error"])
+
+
+# Raw and filler-repaired variants for one window, or nothing if the widths are too far off.
+def build_variants(name: str, width: int, window: list[str]) -> list[dict[str, Any]]:
+    variants = []
+    for line in [window]:
+        tail = line
+        if any(abs(len(item) - width) > config.MRZ_WIDTH_TOLERANCE for item in tail):
             continue
-        tail = lines[-count:]
-        if any(abs(len(line) - width) > config.MRZ_WIDTH_TOLERANCE for line in tail):
-            continue
-        fitted = [fit_line(line, width) for line in tail]
+        width_error = sum(abs(len(item) - width) for item in tail)
+        fitted = [fit_line(item, width) for item in tail]
         lines_out = [item[0] for item in fitted]
         deltas = [item[1] for item in fitted]
-        variants.append({"format": name, "lines": lines_out, "length_deltas": deltas})
-        protected = CHECK_POSITIONS[name]
-        repaired = [repair_filler_runs(line, {col for row, col in protected if row == index}) for index, line in enumerate(lines_out)]
+        variants.append({"format": name, "lines": lines_out, "length_deltas": deltas, "width_error": width_error})
+        repaired = repair_filler_zones(lines_out, name)
         if repaired != lines_out:
-            variants.append({"format": name, "lines": repaired, "length_deltas": deltas, "filler_repaired": True})
+            variants.append({"format": name, "lines": repaired, "length_deltas": deltas, "width_error": width_error, "filler_repaired": True})
     return variants
 
 
@@ -140,12 +145,27 @@ def map_ausweistyp(document_code: str) -> str:
     return "S"
 
 
+# Fields whose shape is fixed by ICAO. A checksum alone cannot catch a letter inside a date,
+# because repair may swap a digit for a letter and the arithmetic still agrees.
+def structural_checks(parsed: dict[str, Any]) -> list[dict[str, Any]]:
+    checks = []
+    for field in ("date_of_birth", "expiry_date"):
+        value = str(parsed.get(field) or "")
+        checks.append({"field": f"{field}_format", "input": value, "expected": "6 digits", "actual": value, "valid": len(value) == 6 and value.isdigit()})
+    sex = str(parsed.get("sex") or "")
+    checks.append({"field": "sex_format", "input": sex, "expected": "M, F or empty", "actual": sex, "valid": sex in {"M", "F", ""}})
+    state = str(parsed.get("issuing_state") or "")
+    checks.append({"field": "issuing_state_format", "input": state, "expected": "1-3 letters", "actual": state, "valid": 1 <= len(state) <= 3 and state.isalpha()})
+    return checks
+
+
 def with_aliases(parsed: dict[str, Any]) -> dict[str, Any]:
     parsed["ausweisnummer"] = parsed["document_number"]
     parsed["nationalitaet"] = parsed["nationality"]
     parsed["gueltigkeitsdatum"] = parsed["expiry_date"]
     parsed["check_digit_results"] = {item["field"]: item for item in parsed["checks"]}
-    parsed["checks_valid"] = all(item["valid"] for item in parsed["checks"])
+    parsed["structural_checks"] = structural_checks(parsed)
+    parsed["checks_valid"] = all(item["valid"] for item in parsed["checks"] + parsed["structural_checks"])
     return parsed
 
 
