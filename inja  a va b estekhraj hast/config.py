@@ -23,6 +23,7 @@ FINAL_JSON_DIR = OUTPUT_DIR / "documents"
 FINAL_CSV_PATH = OUTPUT_DIR / "06_documents_flat.csv"
 
 MRZ_CROP_DIR = CACHE_DIR / "mrz_crops"
+SURFACE_DIR = CACHE_DIR / "surfaces"
 MRZ_DEBUG_DIR = CACHE_DIR / "mrz_overlays"
 FIELD_CROP_DIR = CACHE_DIR / "field_crops"
 
@@ -65,7 +66,19 @@ MRZ_CROP_BORDER = 40
 # Morphological detector: all kernel sizes assume the page is resized to this width.
 MRZ_WORK_WIDTH = 900
 MRZ_MORPH_MIN_SCORE = 1.60
-MRZ_MORPH_MAX_CANDIDATES = 4
+MRZ_MORPH_MAX_CANDIDATES = 6
+MRZ_BOX_PAD_RATIO = 0.06
+
+# Card detection. Photographs of an ID on a table or carpet only work if the card is
+# located and flattened first; searching the raw frame finds carpet texture instead.
+CARD_WORK_WIDTH = 700
+CARD_MIN_AREA_RATIO = 0.08
+MRZ_CARD_SURFACE_BONUS = 0.75
+MRZ_MAX_DESKEW_DEGREES = 30.0
+
+# Re-read a correctly cropped but unreadable band with the vision model. Gated on a
+# successful crop, so a detection failure is never handed to the model to guess at.
+MRZ_LLM_FALLBACK = os.environ.get("MRZ_LLM_FALLBACK", "1") not in {"0", "false", "False"}
 
 # Glyphs RapidOCR returns in place of the MRZ filler character. Substituted, never deleted.
 MRZ_CHAR_FIXES = {

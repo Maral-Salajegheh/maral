@@ -34,9 +34,13 @@ class PrintedFieldResponse(BaseModel):
 # On an MRZ page, the printed fields sit above the band. On a page with no MRZ
 # (the card front, which carries Geburtsort) the whole page is the field zone.
 def crop_printed_field_zone(record: dict[str, Any]) -> Path:
-    image = Image.open(record["resolved_image_path"]).convert("RGB")
+    # Crop from the surface stage 01 measured on. It is already flattened and deskewed,
+    # and the band coordinates are in its frame, not the original page's.
+    surface = record.get("mrz_surface_path")
+    source = surface if surface and Path(surface).is_file() else record["resolved_image_path"]
+    image = Image.open(source).convert("RGB")
     width, height = image.size
-    rotation = int(record.get("rotation_degrees") or 0)
+    rotation = 0 if surface else int(record.get("rotation_degrees") or 0)
     if rotation:
         image = image.rotate(rotation, expand=True)
         width, height = image.size

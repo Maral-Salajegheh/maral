@@ -49,11 +49,17 @@ def load_g07_candidates(input_csv: Path) -> list[dict[str, Any]]:
     return rows
 
 
-# How much one OCR line looks like an MRZ line: uppercase, close to a canonical
-# width, and carrying filler. Lowercase rules out ordinary letter text and addresses.
+# How much one OCR line looks like an MRZ line: uppercase, close to a canonical width,
+# and carrying filler. Lowercase rules out ordinary letter text and addresses. The raw
+# text must also show a real filler glyph or land almost exactly on a canonical width;
+# carpet, wood grain and portrait texture satisfy neither, so they can never be cropped.
 def line_score(text: str) -> float:
     letters = [char for char in text if char.isalpha()]
     if letters and sum(char.islower() for char in letters) / len(letters) > 0.2:
+        return 0.0
+    normalized = normalize_line(text)
+    near_exact = min(abs(len(normalized) - width) for width in config.MRZ_CANONICAL_WIDTHS) <= 3
+    if not any(char in "<>" for char in text) and not near_exact:
         return 0.0
     line = normalize_line(text)
     length = len(line)
@@ -88,7 +94,9 @@ def band_candidates(lines: list[dict[str, Any]], width: int, height: int) -> lis
             pad_x = max(12, int(width * 0.01))
             # Generous vertical margin: if one MRZ line scored too low to join the band,
             # it still lands inside the crop and stage 02 can recover it.
-            pad_y = max(12, int(median_height * 1.6))
+            # Generous vertical margin: when one MRZ line is too faint to join the group,
+            # it still lands inside the crop and stage 02 can recover it.
+            pad_y = max(12, int(median_height * 2.2))
             candidates.append({
                 "x0": max(0, int(min(line["x0"] for line in group)) - pad_x),
                 "y0": max(0, int(min(line["y0"] for line in group)) - pad_y),
@@ -107,7 +115,8 @@ def band_candidates(lines: list[dict[str, Any]], width: int, height: int) -> lis
 # recognize the characters in order to notice the band.
 def verified_morph_band(page: Image.Image) -> dict[str, Any] | None:
     for candidate in morphological_candidates(page)[: config.MRZ_MORPH_MAX_CANDIDATES]:
-        crop = page.crop((candidate["x0"], candidate["y0"], candidate["x1"], candidate["y1"]))
+        surface = candidate.pop("surface_image", page)
+        crop = surface.crop((candidate["x0"], candidate["y0"], candidate["x1"], candidate["y1"]))
         lines = merge_boxes_into_lines(ocr_boxes(crop))
         scores = [line_score(line["text"]) for line in lines]
         confirmed = [score for score in scores if score > 0]
@@ -116,6 +125,7 @@ def verified_morph_band(page: Image.Image) -> dict[str, Any] | None:
         score = sum(confirmed) / len(confirmed)
         if score >= config.MRZ_MIN_GROUP_SCORE:
             return {**candidate, "score": round(score, 3), "line_count": len(confirmed),
+                    "crop_image": crop, "surface_page": surface,
                     "mrz_detector_text": "\n".join(line["text"] for line in lines)}
     return None
 
@@ -127,6 +137,8 @@ def detect_mrz_band(image_path: Path) -> tuple[Image.Image, Image.Image, dict[st
     for angle in (0, 90, 180, 270):
         rotated = source.rotate(angle, expand=True) if angle else source
         morph = verified_morph_band(rotated)
+        # The whole-frame OCR detector is the one that finds carpet and faces on photographs,
+        # so it only runs when the card-first detector found nothing at all.
         candidates = [morph] if morph else band_candidates(merge_boxes_into_lines(ocr_boxes(rotated)), rotated.width, rotated.height)
         rank = (candidates[0]["line_count"], candidates[0]["score"]) if candidates else None
         if rank and (best is None or rank > (best[1]["line_count"], best[1]["score"])):
@@ -136,8 +148,12 @@ def detect_mrz_band(image_path: Path) -> tuple[Image.Image, Image.Image, dict[st
     if best is None:
         raise ValueError("No MRZ-like line band detected on any rotation")
     page, meta = best
-    crop = page.crop((meta["x0"], meta["y0"], meta["x1"], meta["y1"]))
-    return page, crop, {"detector": "rapidocr_lines", **meta, "detector_version": config.MRZ_DETECTOR_VERSION}
+    # The band coordinates belong to the surface they were found on, which may be a
+    # flattened, deskewed card rather than the original page. Later stages must crop from
+    # that same surface or they slice the wrong rectangle out of the original image.
+    surface = meta.pop("surface_page", None) or page
+    crop = meta.pop("crop_image", None) or surface.crop((meta["x0"], meta["y0"], meta["x1"], meta["y1"]))
+    return surface, crop, {"detector": "rapidocr_lines", **meta, "detector_version": config.MRZ_DETECTOR_VERSION}
 
 
 # Save the page with the chosen band outlined, so a failure can be inspected visually.
@@ -159,9 +175,12 @@ def process_candidate(record: dict[str, Any]) -> dict[str, Any]:
     out_path = config.MRZ_CROP_DIR / f"{crop_stem(record)}_{config.MRZ_DETECTOR_VERSION}.png"
     out_path.parent.mkdir(parents=True, exist_ok=True)
     crop.save(out_path)
+    surface_path = config.SURFACE_DIR / f"{crop_stem(record)}_surface.png"
+    surface_path.parent.mkdir(parents=True, exist_ok=True)
+    page.save(surface_path)
     overlay_path = config.MRZ_DEBUG_DIR / f"{crop_stem(record)}_overlay.png"
     save_overlay(page, meta, overlay_path)
-    return {**record, **meta, "mrz_crop_path": str(out_path), "mrz_overlay_path": str(overlay_path), "status": "success", "needs_human_review": False, "error": "", "processed_at_utc": utc_now_iso()}
+    return {**record, **meta, "mrz_crop_path": str(out_path), "mrz_surface_path": str(surface_path), "mrz_overlay_path": str(overlay_path), "status": "success", "needs_human_review": False, "error": "", "processed_at_utc": utc_now_iso()}
 
 
 def main() -> None:
