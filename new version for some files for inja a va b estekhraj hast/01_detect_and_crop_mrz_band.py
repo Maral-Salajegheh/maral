@@ -57,9 +57,11 @@ def line_score(text: str) -> float:
     letters = [char for char in text if char.isalpha()]
     if letters and sum(char.islower() for char in letters) / len(letters) > 0.2:
         return 0.0
+    # MRZ always contains runs of filler. Requiring a literal "<" is too strict, because
+    # OCR returns it as caret, wedge or guillemet; requiring a run after normalization keeps
+    # truncated lines while still excluding scattered punctuation from texture noise.
     normalized = normalize_line(text)
-    near_exact = min(abs(len(normalized) - width) for width in config.MRZ_CANONICAL_WIDTHS) <= 3
-    if not any(char in "<>" for char in text) and not near_exact:
+    if "<<<" not in normalized:
         return 0.0
     line = normalize_line(text)
     length = len(line)
@@ -188,14 +190,13 @@ def main() -> None:
     parser.add_argument("--input", type=Path, default=config.INPUT_PAGES_CSV)
     parser.add_argument("--candidates-output", type=Path, default=config.CANDIDATES_CSV)
     parser.add_argument("--output", type=Path, default=config.MRZ_CROPS_JSONL)
-    parser.add_argument("--force", action="store_true", help="Ignore cached results and reprocess every page")
     args = parser.parse_args()
     candidates = load_g07_candidates(args.input)
     fields = list(dict.fromkeys(field for row in candidates for field in row))
     write_csv(args.candidates_output, candidates, fields)
     latest = read_latest_jsonl(args.output, page_key)
     for record in sorted(candidates, key=lambda item: (item.get("masterindex_id", ""), int_value(item.get("page_number")))):
-        previous = None if args.force else (latest.get(page_key(record)) if record.get("candidate_status") == "success" else None)
+        previous = latest.get(page_key(record)) if record.get("candidate_status") == "success" else None
         if previous and previous.get("status") == "success" and previous.get("detector_version") == config.MRZ_DETECTOR_VERSION:
             continue
         try:

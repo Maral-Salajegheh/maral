@@ -3,15 +3,29 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-PACKAGE_ROOT = Path(__file__).resolve().parents[1]
+EXTRACTION_DIR = Path(__file__).resolve().parent
+PACKAGE_ROOT = EXTRACTION_DIR.parent
 REPO_ROOT = PACKAGE_ROOT.parent
-DATA_DIR = PACKAGE_ROOT / "data"
-RESULTS_DIR = PACKAGE_ROOT / "results"
-EXTRACTION_DIR = PACKAGE_ROOT / "Extraction"
+
+
+# Return the first candidate that exists, else the first one, so the package keeps working
+# when the Extraction folder is copied between repos.
+def first_existing(candidates: list[Path]) -> Path:
+    return next((path for path in candidates if path.exists()), candidates[0])
+
+
+INPUT_DIR = Path(os.environ["EXTRACTION_INPUT_DIR"]) if os.environ.get("EXTRACTION_INPUT_DIR") else first_existing(
+    [REPO_ROOT / "Input", PACKAGE_ROOT / "Input", EXTRACTION_DIR / "Input"]
+)
+DATA_DIR = first_existing([PACKAGE_ROOT / "data", REPO_ROOT / "data", EXTRACTION_DIR / "data"])
+RESULTS_DIR = first_existing([PACKAGE_ROOT / "results", REPO_ROOT / "results", INPUT_DIR])
 CACHE_DIR = EXTRACTION_DIR / "cache"
 OUTPUT_DIR = EXTRACTION_DIR / "outputs"
 
-INPUT_PAGES_CSV = RESULTS_DIR / "variant_a_vision_clip_sample_all_test_pages.csv"
+INPUT_PAGES_CSV = first_existing([
+    INPUT_DIR / "variant_a_vision_clip_sample_all_test_pages.csv",
+    RESULTS_DIR / "variant_a_vision_clip_sample_all_test_pages.csv",
+])
 CANDIDATES_CSV = OUTPUT_DIR / "01_g07_candidates.csv"
 MRZ_CROPS_JSONL = OUTPUT_DIR / "02_mrz_crops.jsonl"
 MRZ_OCR_JSONL = OUTPUT_DIR / "03_mrz_ocr.jsonl"
@@ -47,10 +61,14 @@ MRZ_OCR_BACKEND = os.environ.get("MRZ_OCR_BACKEND", "auto").lower()
 FIELD_TESSERACT_CONFIG = "--psm 6"
 FIELD_TESSERACT_LANG = os.environ.get("FIELD_TESSERACT_LANG", "deu+eng")
 FIELD_EXTRACTION_BACKEND = os.environ.get("FIELD_EXTRACTION_BACKEND", "llm").lower()
-FIELD_OCR_STAGE_VERSION = "surface_crop_v4"
+FIELD_OCR_STAGE_VERSION = "surface_crop_v5"
 
-MRZ_DETECTOR_VERSION = "card_deskew_v4"
-MRZ_OCR_STAGE_VERSION = "tesseract_crop_v4"
+MRZ_DETECTOR_VERSION = "card_deskew_v5"
+# Parser and mapping versions take part in the cache keys, so a change to mrz_utils.py
+# invalidates downstream results instead of silently keeping them.
+MRZ_PARSER_VERSION = "ambiguity_guard_v1"
+AUSWEISTYP_VERSION = "icao_code_v1"
+MRZ_OCR_STAGE_VERSION = "tesseract_crop_v5"
 
 # Detector: a band is accepted at MRZ_MIN_GROUP_SCORE, and rotation search stops at MRZ_GOOD_SCORE.
 MRZ_MIN_GROUP_SCORE = 1.20
@@ -79,6 +97,11 @@ MRZ_MAX_DESKEW_DEGREES = 30.0
 # Re-read a correctly cropped but unreadable band with the vision model. Gated on a
 # successful crop, so a detection failure is never handed to the model to guess at.
 MRZ_LLM_FALLBACK = os.environ.get("MRZ_LLM_FALLBACK", "1") not in {"0", "false", "False"}
+
+# A filler zone is only rewritten when it is almost entirely filler already, and doing so
+# is recorded as a destructive repair that needs review.
+MRZ_FILLER_ZONE_RATIO = 0.8
+MRZ_MAX_REPAIRS_EXAMINED = 200
 
 # Glyphs RapidOCR returns in place of the MRZ filler character. Substituted, never deleted.
 MRZ_CHAR_FIXES = {

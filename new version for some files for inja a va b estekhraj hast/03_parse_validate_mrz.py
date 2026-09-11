@@ -12,13 +12,23 @@ from Life.Extraction.utils import append_jsonl, page_key, read_latest_jsonl, utc
 # Re-read a band the OCR could not parse, but only when stage 01 cropped it successfully.
 # A finger or glare over a character is worth a second look; a failed crop is not, because
 # the model would just be describing whatever the wrong rectangle happened to contain.
-def llm_retry(record: dict[str, Any]) -> tuple[dict[str, Any] | None, str, str]:
-    crop_path = Path(str(record.get("mrz_crop_path") or ""))
-    if not config.MRZ_LLM_FALLBACK or not crop_path.is_file():
-        return None, "", ""
-    from Life.Extraction.llm_mrz import transcribe_mrz
+_LLM_AVAILABLE = True
 
-    text = transcribe_mrz(crop_path)
+
+def llm_retry(record: dict[str, Any]) -> tuple[dict[str, Any] | None, str, str]:
+    global _LLM_AVAILABLE
+    crop_path = Path(str(record.get("mrz_crop_path") or ""))
+    if not config.MRZ_LLM_FALLBACK or not _LLM_AVAILABLE or not crop_path.is_file():
+        return None, "", ""
+    try:
+        from Life.Extraction.llm_mrz import transcribe_mrz
+
+        text = transcribe_mrz(crop_path)
+    except ImportError:
+        # SecureGPT is not importable in this environment. Skip the retry for the rest of
+        # the run and let the real parse error stand, instead of masking it with this one.
+        _LLM_AVAILABLE = False
+        return None, "", ""
     return parse_with_repair(text), text, "llm_vision"
 
 
@@ -31,13 +41,15 @@ def main() -> None:
     records = read_latest_jsonl(args.input, page_key)
     done = read_latest_jsonl(args.output, page_key)
     for key, record in sorted(records.items()):
-        previous = None if args.force else done.get(key)
+        # Validate the current input first: an upstream failure must not leave an old success in place.
+        previous = None if args.force or record.get("status") != "success" else done.get(key)
         if (
             previous
             and previous.get("status") == "success"
             and previous.get("mrz_ocr_text") == record.get("mrz_ocr_text")
             and previous.get("mrz_crop_path") == record.get("mrz_crop_path")
             and previous.get("detector_version") == record.get("detector_version")
+            and previous.get("mrz_parser_version") == config.MRZ_PARSER_VERSION
         ):
             continue
         if record.get("status") != "success":

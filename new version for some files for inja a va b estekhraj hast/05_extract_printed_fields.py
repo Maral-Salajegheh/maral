@@ -11,7 +11,7 @@ from pydantic import BaseModel
 
 from Life.Extraction import config
 from Life.Extraction.mrz_utils import transliterate
-from Life.Extraction.utils import append_jsonl, page_key, read_latest_jsonl, run_field_ocr, utc_now_iso
+from Life.Extraction.utils import append_jsonl, document_key, page_key, read_latest_jsonl, run_field_ocr, utc_now_iso
 
 FIELD_SYSTEM_PROMPT = """You extract printed text fields from a cropped identity-document field zone. Return only the requested JSON fields. If a field is not visible or illegible, return null. Do not guess."""
 FIELD_USER_PROMPT = """Read the cropped field zone and return JSON with exactly these keys: geburtsort, ausstellende_behoerde, surname, given_names. Use the printed text only. Return null for any illegible or missing value."""
@@ -98,7 +98,12 @@ def name_cross_check(record: dict[str, Any], printed: dict[str, str | None]) -> 
             status = "not_available"
         checks.append({"field": mrz_field, "mrz_value": mrz_value, "printed_value": printed_value, "status": status})
     mismatch = any(item["status"] == "mismatch" for item in checks)
-    return {"name_cross_check": checks, "name_cross_check_passed": not mismatch, "name_cross_check_mismatch": mismatch}
+    compared = any(item["status"] in {"match", "mismatch"} for item in checks)
+    # "Not checked" is not the same as "verified": only call it passed when a real
+    # comparison happened and agreed.
+    state = "mismatched" if mismatch else ("matched" if compared else "not_checked")
+    return {"name_cross_check": checks, "name_cross_check_state": state,
+            "name_cross_check_passed": state == "matched", "name_cross_check_mismatch": mismatch}
 
 
 def extract_with_ocr(crop_path: Path) -> dict[str, Any]:
@@ -159,6 +164,8 @@ def call_securegpt_field_backend(crop_path: Path) -> dict[str, Any]:
         parsed = parse_llm_answer(answer)
         return {
             "field_extraction_source": "field_llm",
+            "field_extraction_backend": "llm",
+            "field_ocr_stage_version": config.FIELD_OCR_STAGE_VERSION,
             "field_llm_model_id": MODEL_NAME,
             "field_llm_temperature": TEMPERATURE,
             "field_llm_seed": SEED,
@@ -189,9 +196,11 @@ def main() -> None:
     done = read_latest_jsonl(args.output, page_key)
     # A document's other page still needs field extraction: Geburtsort is printed on the
     # card front, which has no MRZ and therefore never reaches this stage as a success.
-    with_mrz = {str(record.get("masterindex_id")) for record in records.values() if record.get("checks_valid")}
+    with_mrz = {document_key(record) for record in records.values() if record.get("checks_valid")}
     for key, record in sorted(records.items()):
-        previous = None if args.force else done.get(key)
+        companion = document_key(record) in with_mrz
+        upstream_ok = record.get("status") == "success" or companion
+        previous = None if args.force or not upstream_ok else done.get(key)
         if (
             previous
             and previous.get("status") == "success"
@@ -200,9 +209,9 @@ def main() -> None:
             and previous.get("document_number") == record.get("document_number")
             and previous.get("mrz_crop_path") == record.get("mrz_crop_path")
             and previous.get("detector_version") == record.get("detector_version")
+            and previous.get("mrz_parser_version") == record.get("mrz_parser_version")
         ):
             continue
-        companion = str(record.get("masterindex_id")) in with_mrz
         if record.get("status") != "success" and not companion:
             append_jsonl(args.output, {**record, "status": "failed", "needs_human_review": True, "error": record.get("error") or "Ausweistyp mapping failed", "processed_at_utc": utc_now_iso()})
             continue

@@ -16,7 +16,8 @@ def main() -> None:
     crops = read_latest_jsonl(args.input, page_key)
     done = read_latest_jsonl(args.output, page_key)
     for key, record in sorted(crops.items()):
-        previous = None if args.force else done.get(key)
+        # Validate the current input first: an upstream failure must not leave an old success in place.
+        previous = None if args.force or record.get("status") != "success" else done.get(key)
         if (
             previous
             and previous.get("status") == "success"
