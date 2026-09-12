@@ -128,15 +128,16 @@ The AXA client retains `cache_prompts=True` from the supplied connection setup.
 - `partner_candidates.csv`: documents with status ready; nothing is sent externally.
 - `pages.jsonl`: page audit, written progressively during execution.
 - `unresolved_pages.jsonl`: pages with unresolved document associations.
-- `mrz_crops/`: upscaled crops, separated by processing-page index.
+- `Extraction/cache/<run_id>/mrz/`: full OCR inputs, MRZ crops, candidate
+  surfaces, and red-box overlays, separated by processing-page index.
 - `summary.json`: counts and model metadata.
 
 Compare each crop with its `mrz.attempts` entry in `pages.jsonl`, which records the
 view label, region, and OCR text. `mrz.parsed` contains the accepted parse;
 `mrz.errors` records failures. `llm_requested_fields` and field sources show fallback.
-Colored overlays are not generated. Crops are saved before adding Tesseract's
-20-pixel white border. Full-page fallback images are not saved, but their OCR text
-is recorded. Pages with no proposed crops may have no crop images.
+Red-box candidate overlays and full-page fallback inputs are generated. Crops are
+saved before adding Tesseract's 20-pixel white border. Their OCR text is recorded
+in `pages.jsonl`. If no candidate is found, full-page inputs are still saved.
 
 | Status | Meaning |
 |---|---|
@@ -189,7 +190,7 @@ Use the existing `-e NAME` option if your Pixi environment is named.
 
 ## Validation and limitations
 
-The 18 offline tests cover path-free predictions, ambiguous metadata, full LLM
+The 20 offline tests cover path-free predictions, ambiguous metadata, full LLM
 fallback, MRZ preservation, front/back grouping, distinct document numbers,
 unresolved pages, and JSON/CSV consistency. AXA calls are mocked; live AXA access
 and real-document accuracy have not been tested. The standalone client was also

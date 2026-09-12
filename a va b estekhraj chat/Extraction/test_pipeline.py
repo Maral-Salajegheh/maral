@@ -188,6 +188,25 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual(audit["ocr_text"], text)
             self.assertIsNone(audit["parsed"])
 
+    def test_full_page_ocr_input_is_saved_in_debug_cache(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path, debug = root / "page.png", root / "debug"
+            Image.new("RGB", (200, 100), "white").save(path)
+            with patch("mrz.proposed_crops", return_value=[]), \
+                 patch("mrz.tesseract", return_value="not an mrz"):
+                mrz.read_mrz(path, debug)
+            self.assertTrue((debug / "rotation_0_full.png").is_file())
+
+    def test_all_image_resolution_failures_stop_before_llm(self):
+        failed = [{"masterindex_id": "MID", "page_number": 1,
+                   "resolution_error": "metadata not found"}]
+        with patch("extract.load_pages", return_value=failed), \
+             patch("extract.Extractor") as constructor:
+            with self.assertRaisesRegex(RuntimeError, "Image resolution failed for all"):
+                extract.main()
+        constructor.assert_not_called()
+
     def test_one_command_from_prediction_to_document(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -202,7 +221,8 @@ class PipelineTests(unittest.TestCase):
             self.llm.metadata.return_value = {"model": "fake"}
             with patch.object(config, "INPUT_CSV", prediction), patch.object(config, "DATA_DIRS", [root]), \
                  patch.object(config, "INVENTORY_FILES", []), patch.object(config, "IMAGE_ROOTS", [root]), \
-                 patch.object(config, "OUTPUT_DIR", root / "outputs"), patch("extract.Extractor", return_value=self.llm), \
+                 patch.object(config, "OUTPUT_DIR", root / "outputs"), \
+                 patch.object(config, "CACHE_DIR", root / "cache"), patch("extract.Extractor", return_value=self.llm), \
                  patch("extract.read_mrz", return_value=audit):
                 extract.main()
             self.assertEqual(self.llm.read.call_count, 2)

@@ -14,7 +14,8 @@ from pages import load_pages
 def empty_page(metadata):
     return {"metadata": metadata, "fields": empty_fields(), "issues": [],
             "document_kind": "unknown", "type_evidence": None, "multiple_documents": False,
-            "mrz": None, "llm": None, "llm_requested_fields": []}
+            "mrz": None, "mrz_status": "not_run", "llm": None,
+            "llm_status": "not_run", "llm_requested_fields": []}
 
 
 def set_field(page, name, value, source):
@@ -46,11 +47,14 @@ def extract_page(metadata, llm, debug_dir):
     if metadata.get("resolution_error"):
         page["resolution_error"] = metadata["resolution_error"]
         page["issues"].append("image_resolution_failed")
+        page["mrz_status"] = "skipped"
+        page["llm_status"] = "skipped"
         return page
     path = Path(metadata["resolved_image_path"])
     page["mrz"] = read_mrz(path, debug_dir)
     page["multiple_documents"] = page["mrz"]["multiple_documents"]
     parsed = page["mrz"]["parsed"]
+    page["mrz_status"] = "success" if parsed else "failed"
     if parsed:
         for name, value in parsed["fields"].items():
             set_field(page, name, value, "mrz")
@@ -58,7 +62,9 @@ def extract_page(metadata, llm, debug_dir):
     page["llm_requested_fields"] = missing
     try:
         apply_llm(page, llm.read(path, missing))
+        page["llm_status"] = "success"
     except Exception as error:
+        page["llm_status"] = "failed"
         page["issues"].append("llm_failed: " + str(error))
     return page
 
@@ -92,6 +98,11 @@ def save_results(output, pages, model):
     write_jsonl(output / "unresolved_pages.jsonl", unresolved)
     summary = {"pages": len(pages), "documents": len(documents), "unresolved_pages": len(unresolved),
                "ready": sum(d["status"] == "ready" for d in documents), "llm_model": model,
+               "image_resolution_failed": sum(p.get("resolution_error") is not None for p in pages),
+               "mrz_success": sum(p["mrz_status"] == "success" for p in pages),
+               "mrz_failed": sum(p["mrz_status"] == "failed" for p in pages),
+               "llm_success": sum(p["llm_status"] == "success" for p in pages),
+               "llm_failed": sum(p["llm_status"] == "failed" for p in pages),
                "created_at_utc": datetime.now(timezone.utc).isoformat()}
     (output / "summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"Pages: {len(pages)} | Documents: {len(documents)} | Unresolved: {len(unresolved)} | Ready: {summary['ready']}")
@@ -101,19 +112,33 @@ def main():
     pages = load_pages(config.INPUT_CSV)
     if not pages:
         raise ValueError("No G07 pages in the prediction CSV")
+    unresolved_images = [page for page in pages if page.get("resolution_error")]
+    if len(unresolved_images) == len(pages):
+        raise RuntimeError(
+            f"Image resolution failed for all {len(pages)} G07 pages. "
+            f"First error: {unresolved_images[0]['resolution_error']}"
+        )
+    if unresolved_images:
+        print(f"WARNING: image resolution failed for {len(unresolved_images)}/{len(pages)} pages")
     llm = Extractor()
-    output = config.OUTPUT_DIR / datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    run_id = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    output = config.OUTPUT_DIR / run_id
+    debug_root = config.CACHE_DIR / run_id
     output.mkdir(parents=True, exist_ok=False)
+    debug_root.mkdir(parents=True, exist_ok=False)
     results = []
     with (output / "pages.jsonl").open("w", encoding="utf-8") as audit:
         for index, metadata in enumerate(pages, 1):
-            result = extract_page(metadata, llm, output / "mrz_crops" / f"page_{index:06d}")
+            result = extract_page(metadata, llm, debug_root / "mrz" / f"page_{index:06d}")
             audit.write(json.dumps(result, ensure_ascii=False) + "\n")
             audit.flush()
             results.append(result)
-            print(f"Extracted page {index}/{len(pages)}")
+            first_issue = result["issues"][0] if result["issues"] else "none"
+            print(f"Page {index}/{len(pages)} | MRZ={result['mrz_status']} "
+                  f"| LLM={result['llm_status']} | first_issue={first_issue}")
     save_results(output, results, llm.metadata())
     print(f"Output: {output}")
+    print(f"Debug cache: {debug_root}")
 
 
 if __name__ == "__main__":

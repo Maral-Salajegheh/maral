@@ -6,7 +6,7 @@ import re
 import subprocess
 import tempfile
 
-from PIL import Image, ImageOps
+from PIL import Image, ImageDraw, ImageOps
 
 
 def digit(text):
@@ -90,19 +90,28 @@ def parse_mrz(text):
 
 
 def tesseract(image, directory):
+    import config
     path = Path(directory) / "ocr.png"
     ImageOps.expand(image, border=20, fill="white").save(path)
-    command = [os.getenv("TESSERACT_CMD", "tesseract"), str(path), "stdout", "--psm", "6",
-               "-c", "tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789<"]
-    return subprocess.run(command, capture_output=True, text=True, check=True, timeout=30).stdout
+    command = [config.TESSERACT_CMD, str(path), "stdout", "--psm",
+               config.MRZ_TESSERACT_PSM, "-c",
+               "tessedit_char_whitelist=" + config.MRZ_TESSERACT_WHITELIST]
+    return subprocess.run(command, capture_output=True, text=True, check=True,
+                          timeout=config.MRZ_OCR_TIMEOUT_SECONDS).stdout
 
 
-def proposed_crops(page):
+def proposed_crops(page, debug_dir=None, prefix="view"):
     from mrz_morph import morphological_candidates
     import config
-    for item in morphological_candidates(page)[:config.MRZ_MAX_CROPS]:
+    for index, item in enumerate(morphological_candidates(page)[:config.MRZ_MAX_CROPS]):
         surface = item["surface_image"]
         box = (item["x0"], item["y0"], item["x1"], item["y1"])
+        if debug_dir:
+            debug_dir.mkdir(parents=True, exist_ok=True)
+            surface.save(debug_dir / f"{prefix}_{item['surface']}_surface.png")
+            overlay = surface.copy()
+            ImageDraw.Draw(overlay).rectangle(box, outline="red", width=5)
+            overlay.save(debug_dir / f"{prefix}_candidate_{index}_overlay.png")
         crop = surface.crop(box)
         scale = min(4.0, max(1.0, 2000 / max(crop.width, 1)))
         crop = crop.resize((max(1, round(crop.width * scale)), max(1, round(crop.height * scale))), Image.Resampling.LANCZOS)
@@ -153,7 +162,7 @@ def scan_rotations(source, directory, audit, debug_dir):
     for angle in (0, 90, 180, 270):
         page, found = source.rotate(angle, expand=True), []
         try:
-            crops = list(proposed_crops(page)) if morphology_available else []
+            crops = list(proposed_crops(page, debug_dir, f"rotation_{angle}")) if morphology_available else []
         except Exception as error:
             audit["errors"].append("MRZ localisation: " + str(error))
             morphology_available = False
@@ -163,7 +172,7 @@ def scan_rotations(source, directory, audit, debug_dir):
             if parsed:
                 found.append(parsed)
         if not found and not audit["multiple_documents"]:
-            parsed = scan_view(page, directory, audit, f"rotation_{angle}_full", None)
+            parsed = scan_view(page, directory, audit, f"rotation_{angle}_full", debug_dir)
             if parsed:
                 found.append(parsed)
         if found or audit["multiple_documents"]:
