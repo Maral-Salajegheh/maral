@@ -5,7 +5,6 @@ EXTRACTION_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = EXTRACTION_DIR.parent
 INPUT_CSV = EXTRACTION_DIR / "Input/variant_a_vision_clip_sample_all_test_pages.csv"
 OUTPUT_DIR = EXTRACTION_DIR / "outputs"
-SECUREGPT_WRAPPER_DIR = PROJECT_ROOT
 
 # Same metadata formats as the original pipeline.
 DATA_DIRS = [PROJECT_ROOT / "data", EXTRACTION_DIR / "data"]

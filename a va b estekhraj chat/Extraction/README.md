@@ -132,18 +132,23 @@ ready تضمین دقت صددرصد نیست. اگر LLM قطع شود، مقا
 
 فقط `extract.py` اجرایی است. باقی فایل‌ها توابع کمکی‌اند:
 config.py (مسیرها)، pages.py (metadata)، mrz_morph.py (تصویر)، mrz.py (OCR/Parser)،
-llm.py (AXA)، documents.py (تجمیع)، test_pipeline.py (تست).
+securegpt_client.py (اتصال AXA و آماده‌سازی تصویر)، llm.py (پرامپت استخراج و اعتبارسنجی پاسخ)، documents.py (تجمیع)، test_pipeline.py (تست).
 ماژول تصویر از فایل ارسالی شما اقتباس شده؛ علامت چرخش deskew و حالت تصویر سفید اصلاح شده‌اند.
 از `Life.Extraction` استفاده نمی‌شود.
 
-محیط Pixi قبلاً فعال شما باید Pillow، numpy، OpenCV و وابستگی‌های securegpt_vision
+محیط Pixi قبلاً فعال شما باید Pillow، numpy، OpenCV و کتابخانهٔ axallm
 را داشته باشد. Tesseract executable نیز برای مسیر OCR لازم است؛ می‌توان مسیرش را با
 TESSERACT_CMD تنظیم کرد. هیچ وابستگی یا credential روی سیستم شما خودکار تغییر نمی‌کند.
-همان مدل، seed، temperature، آماده‌سازی تصویر و retryهای wrapper قبلی استفاده می‌شوند.
-اگر wrapper کنار pixi.toml نیست، مسیرش را در config.py مشخص کنید.
+تنظیمات مدل، seed، temperature، محدودیت حجم تصویر و retry از اتصال ارسالی شما اقتباس شده‌اند.
+این پایپلاین هیچ import یا وابستگی اجرایی به securegpt_vision.py ندارد؛ نیازی به کپی یا جابه‌جایی آن نیست.
+فایل securegpt_client.py داخل Extraction قرار می‌گیرد و هیچ پرامپت یا schema تشخیص صفحات ندارد.
+پرامپت سیستم و درخواست استخراج در llm.py به آلمانی هستند؛ کلیدهای JSON و مقادیر قراردادی ثابت‌اند.
+متغیرهای محیطی SECUREGPT_MODEL_NAME و SECUREGPT_MODEL_VERSION باید مانند محیط فعال قبلی موجود باشند.
+MODEL_VERSION مانند wrapper ارسالی اعتبارسنجی می‌شود؛ پارامتر جدیدی به سازندهٔ SDK اضافه نشده است.
+تصویر پیش از ارسال بر اساس EXIF جهت‌دهی می‌شود. مسیرهای metadata و تصاویر همچنان در config.py هستند.
 
 ```bash
-pixi run python -c "import axallm, cv2, securegpt_vision; print('imports OK')"
+pixi run python -c "import axallm, cv2; print('imports OK')"
 pixi run python -m unittest discover -s Extraction -p 'test_*.py' -v
 pixi run python Extraction/extract.py
 ```

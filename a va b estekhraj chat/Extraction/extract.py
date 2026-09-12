@@ -1,7 +1,6 @@
 """Run from the Pixi project root: pixi run python Extraction/extract.py"""
 import csv
 import json
-import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -102,7 +101,6 @@ def main():
     pages = load_pages(config.INPUT_CSV)
     if not pages:
         raise ValueError("No G07 pages in the prediction CSV")
-    sys.path.insert(0, str(config.SECUREGPT_WRAPPER_DIR))
     llm = Extractor()
     output = config.OUTPUT_DIR / datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     output.mkdir(parents=True, exist_ok=False)
