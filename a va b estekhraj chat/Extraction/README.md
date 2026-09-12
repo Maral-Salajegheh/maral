@@ -1,151 +1,183 @@
-# استخراج مدارک هویتی — یک اجرای واحد
+# Identity document extraction
 
-اجرا همیشه از ریشهٔ پروژه، کنار `pixi.toml`:
+Run from the project root, next to `pixi.toml`:
 
 ```bash
 pixi run python Extraction/extract.py
 ```
 
-نیازی به واردکردن مسیر CSV یا اجرای `group_documents.py` نیست.
-فایل‌های این بسته را با نسخهٔ قبلی مخلوط نکنید. `securegpt_vision.py` فعلی را تغییر ندهید.
+No input-path argument or separate grouping run is required. Use this bundle's
+files together. There is no dependency on `securegpt_vision.py`.
 
-## ورودی و مسیر تصاویر
+## Input and image lookup
 
-ورودی پیش‌فرض:
+Default input: `Extraction/Input/variant_a_vision_clip_sample_all_test_pages.csv`.
+Required columns: `masterindex_id`, `page_number`, `predicted_page_sst`.
+Only G07 rows are selected. Image paths are not required in this CSV.
 
-`Extraction/Input/variant_a_vision_clip_sample_all_test_pages.csv`
-
-ستون‌های لازم: `masterindex_id`، `page_number`، `predicted_page_sst`.
-فقط ردیف‌های `G07` انتخاب می‌شوند. داشتن مسیر تصویر در CSV الزامی نیست.
-
-همان فرمت‌های metadata کد اولیه خوانده می‌شوند:
+Configured metadata sources:
 
 - `data/*_page_labels.jsonl`
 - `data/ab1_pseudo_documents.csv`
-- فایل‌های مشابه در `Extraction/data`
-- `outputs/page_inventory.csv` در ریشهٔ پروژه
+- Equivalent files under `Extraction/data`
+- `outputs/page_inventory.csv` under the project root
 - `Extraction/Input/page_inventory.csv`
 
-اتصال اولیه با MID و page_number انجام می‌شود؛ اگر PDF path یا image hash در ورودی
-موجود باشند برای محدودکردن تطبیق استفاده می‌شوند. `source_page_number` جایگزین خودکار
-page_number نیست؛ شمارهٔ صفحه در metadata و prediction باید معنای یکسان داشته باشد.
-مسیر، PDF path و سایر اطلاعات موجود از metadata به ردیف افزوده می‌شوند.
-اگر چند تصویر نامزد باشند، مسیر حدس زده نمی‌شود؛ آن صفحه به بررسی می‌رود.
-رکورد JSONL خراب باعث خطای واضح خواندن metadata می‌شود، نه حذف بی‌صدای آن.
+Lookup uses MID and page number; PDF path and image hash, when supplied in the
+prediction row, narrow the match. `source_page_number` is not an automatic
+substitute for `page_number`: metadata and predictions must use consistent page
+numbering. Available metadata is retained. Ambiguous or missing image matches
+are recorded for review. Malformed metadata JSONL raises an explicit error.
 
-همهٔ مسیرها در `config.py` قرار دارند. `PROJECT_ROOT` همان والد پوشهٔ Extraction است.
-`IMAGE_ROOTS` مسیرهای قدیمی ارسال‌شده را نیز حفظ کرده است. اگر metadata یا تصاویر روی
-سرور جای دیگری هستند، فقط `DATA_DIRS`، `INVENTORY_FILES` و `IMAGE_ROOTS` را در config
-با مسیر واقعی هماهنگ کنید؛ مسیر واقعی سرور از این محیط قابل تأیید نیست.
+All corpus paths are in `config.py`. `PROJECT_ROOT` is the parent of Extraction.
+Adjust `DATA_DIRS`, `INVENTORY_FILES`, and `IMAGE_ROOTS` to the actual server layout.
+Legacy image roots from the supplied configuration remain included; their presence
+on your server has not been verified here.
 
-## مسیر پردازش
+## Processing
 
-1. تصویر صفحه از metadata پیدا می‌شود؛ ردیف‌های تکراریِ همان تصویر و PDF حذف می‌شوند.
-2. تشخیص کارت، اصلاح پرسپکتیو و deskew از ماژول morphology قبلی استفاده می‌کنند.
-3. چند ناحیهٔ MRZ پیشنهاد می‌شود؛ برش‌ها بزرگ‌نمایی و با Tesseract خوانده می‌شوند.
-4. Parser فقط TD1/TD2/TD3 با طول دقیق، ساختار قابل‌قبول و checksum صحیح را می‌پذیرد.
-5. شمارهٔ مدرک، ملیت و تاریخ انقضای معتبر از MRZ حفظ می‌شوند.
-6. AXA LLM تصویر کامل را برای فیلدهای باقی‌مانده و نوع مدرک می‌خواند.
-7. اگر MRZ پیدا نشد یا خواندن/اعتبارسنجی آن شکست خورد، LLM هر شش فیلد را می‌خواند.
-8. نتایج استخراج‌شده با شمارهٔ مدرک مشترک در همان MID تجمیع می‌شوند؛ OCR/LLM دوباره اجرا نمی‌شود.
+1. Resolve images using metadata; remove duplicate image/PDF rows.
+2. Locate card regions, correct perspective, and deskew.
+3. Propose MRZ crops, upscale them, and run Tesseract.
+4. Accept exact-width TD1/TD2/TD3 text with structural and checksum validation.
+5. Preserve document number, nationality, and expiry from accepted MRZ results.
+6. Ask AXA LLM to read missing fields and identify document kind from the full image.
+7. If MRZ detection, OCR, or validation fails, request all six fields from the LLM.
+8. Group extracted pages by matching document number within the same MID,
+   without repeating OCR or LLM calls.
 
-MRZ هیچ padding، حذف حروف، جایگزینی حدسی یا repair ندارد. Whitelist در Tesseract فعال است.
-اگر crop نتیجه ندهد، OCR کل تصویر هم امتحان می‌شود؛ چهار جهت ۰/۹۰/۱۸۰/۲۷۰ بررسی می‌شوند.
-خطاهای OCR و متن تلاش‌ها در audit می‌مانند. نبود Tesseract/OpenCV می‌تواند باعث استفادهٔ
-بیشتر از LLM شود و در audit ثبت می‌شود؛ موفقیت LLM وابسته به موفقیت MRZ نیست.
+If crops fail, full-page OCR is attempted. Rotations of 0, 90, 180, and 270 degrees
+are tried until an accepted result or ambiguity is found. OCR text and errors are
+audited. Missing Tesseract/OpenCV can increase LLM fallback usage; LLM extraction
+does not depend on successful MRZ reading.
 
-## شش فیلد نهایی
+## Fields
 
-| نام خروجی | معنی | منبع اولیه |
+| Output field | Meaning | Primary source |
 |---|---|---|
-| geburtsort | محل تولد | LLM |
-| ausweisnummer | شمارهٔ مدرک | MRZ، در صورت شکست LLM |
-| ausweistyp | نوع مدرک P/R/S | بررسی تصویری LLM و نگاشت ثابت |
-| gueltigkeitsdatum | تاریخ انقضا | MRZ، در صورت شکست LLM |
-| ausstellende_behoerde | مرجع صادرکننده | LLM |
-| nationalitaet | ملیت | MRZ، در صورت شکست LLM |
+| `geburtsort` | Place of birth | LLM |
+| `ausweisnummer` | Document number | MRZ, otherwise LLM |
+| `ausweistyp` | Partner document type P/R/S | Visual LLM kind and fixed mapping |
+| `gueltigkeitsdatum` | Expiry date | MRZ, otherwise LLM |
+| `ausstellende_behoerde` | Issuing authority | LLM |
+| `nationalitaet` | Nationality | MRZ, otherwise LLM |
 
-مقادیر MRZ با پاسخ LLM بازنویسی نمی‌شوند. source و مسیر صفحه برای هر مقدار نگهداری می‌شود.
-نام و جنسیت جزو فیلدهای تجاری درخواست‌شده نیستند؛ ممکن است در متن خام OCR وجود داشته باشند.
-Checksum از شماره/تاریخ‌ها محافظت می‌کند؛ ملیت به‌خودی‌خود checksum ندارد.
+LLM values do not overwrite accepted MRZ values on the same page. Each field
+retains its source and image path. Names and sex are not requested output fields,
+although they may occur in raw OCR. Nationality has no MRZ checksum protection.
 
-## اتصال پشت‌ورو و خروجی مدرک‌محور
+## OCR characters and German text
 
-گروه‌بندی بر اساس `(masterindex_id, extracted_ausweisnummer)` است؛ case و فاصله‌ها نادیده
-گرفته می‌شوند، اما اختلاف یک کاراکتر، punctuation مشکوک یا شمارهٔ ناقص اصلاح نمی‌شود.
-اتصال هرگز از مرز MID عبور نمی‌کند. دو سمت در PDFهای متفاوتِ همان MID، اگر شمارهٔ
-یکسان داشته باشند، می‌توانند متصل شوند؛ PDFهای منبع در خروجی ثبت می‌شوند.
-داشتن MID مشترک، PDF مشترک یا evidence_code برابر `multiple_id_sides` به‌تنهایی اتصال ایجاد نمی‌کند.
+The Tesseract whitelist applies only to MRZ OCR: `ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789<`.
+It does not filter images sent to the LLM or returned printed fields. German
+characters such as `ä`, `ö`, `ü`, and `ß` can remain in printed field values.
+JSON and CSV use UTF-8; CSV includes a BOM.
 
-اختلاف اطلاعات دو صفحه ثبت و نتیجه review می‌شود. در اختلاف مقدار، MRZ اولویت دارد،
-اما اختلاف پنهان نمی‌شود. برای مقایسهٔ ملیت، D/DEU/DEUTSCH/GERMAN یکسان شناخته می‌شوند؛
-نگاشت جامع کد کشورهای Partner در این بسته فرض نشده است.
+The old `MRZ_CHAR_FIXES` and `OCR_CONFUSIONS` dictionaries are not used. They
+substituted symbols with `<` or explored alternatives such as O/0 and I/1;
+they were not German alphabet settings. This parser does not pad, truncate,
+substitute glyphs, or repair document numbers. Strict parsing can reject
+recoverable OCR text and increase LLM fallback usage.
 
-شمارهٔ خوانده‌شده از LLM هم ممکن است خطا داشته باشد: اتصال با شماره یک قاعدهٔ عملی است،
-نه اثبات هویت. تضاد نوع مدرک، تاریخ، ملیت یا سایر فیلدها باعث review می‌شود.
-اگر دو مدرک واقعاً متفاوت شمارهٔ یکسان داشته باشند و شواهد متناقض استخراج نشود، این قاعده
-ممکن است آن‌ها را یکی بداند؛ کیفیت و نرخ اتصال باید روی دادهٔ واقعی ارزیابی شود.
+## Combining document sides
 
-**صفحه بدون شمارهٔ قابل‌استفاده، تصویر نامشخص یا تصویر شامل چند مدرک متفاوت، به‌عنوان
-یک مدرک قطعی جعل نمی‌شود.** این موارد جداگانه در `unresolved_pages.jsonl` قرار می‌گیرند؛
-فیلدهای استخراج‌شده از آن‌ها حفظ می‌شود. تطبیق تصویری دوباره برای اتصال مبهم اضافه نشده است.
-اگر شماره فقط روی یک سمت خوانده شود، سمت دیگر تا تعیین اتصال وارد مدرک نمی‌شود.
-این محدودیت واقعیِ نبود شناسهٔ مدرک در ورودی است، نه حذف اطلاعات آن صفحه.
+Grouping uses `(masterindex_id, extracted_ausweisnummer)`. Case and whitespace
+are normalized. One-character differences are not repaired, and numbers with
+punctuation are not used as anchors. Grouping never crosses MIDs. Matching numbers
+can combine sides from different PDFs in one MID; source PDF paths are retained.
+A shared MID, shared PDF, or `multiple_id_sides` screening label alone does not link pages.
 
-## مدارک مجاز
+Conflicts trigger review. MRZ values take precedence without hiding conflicts.
+German nationality variants such as D, DEU, DEUTSCH, and GERMAN compare as equivalent;
+no complete partner country-code mapping is assumed.
 
-نسخه‌های موقت نیز مشمول همین دسته‌ها هستند:
+LLM-read numbers can be wrong. Number matching is a practical rule, not proof of
+identity. Different documents with the same number can merge if no contradictory
+fields are extracted. Evaluate grouping quality on actual data.
 
-- Personalausweis → P
-- Reisepass، Dienstpass، Diplomatenpass → R
-- Aufenthaltstitel فقط با شاهد صریح Passersatz → S
+Pages without a usable number, unresolved images, or images containing multiple
+distinct documents go to `unresolved_pages.jsonl`, retaining extracted values.
+They are not emitted as confidently identified documents. No second visual
+matching pass is implemented. If only one side has a readable number, the other
+side remains unresolved until its association is established.
 
-اقامت معمولی خودکار Passersatz محسوب نمی‌شود. S به معنی پذیرش هر مدرک دیگر نیست.
-نگاشت دو نوع گذرنامهٔ خدمت/دیپلماتیک به R بر مبنای خانوادهٔ گذرنامه است؛ اگر Partner
-تعریف متفاوت دارد، `TYPE_CODES` در llm.py باید با تعریف آن هماهنگ شود.
-این تشخیص نوع بر اساس تصویر است و اصالت مدرک را اثبات نمی‌کند.
+## Accepted kinds
 
-## فایل‌های خروجی
+Regular and provisional versions use this mapping:
 
-هر اجرا پوشهٔ تازه‌ای در `Extraction/outputs/<timestamp>` می‌سازد؛ فایل گروه‌بندی قدیمی
-یا cache مصرف نمی‌شود. فایل‌های اجراهای قبل پاک نمی‌شوند.
+| Document kind | Partner code |
+|---|---|
+| Personalausweis | P |
+| Reisepass | R |
+| Dienstpass | R |
+| Diplomatenpass | R |
+| Aufenthaltstitel with explicit Passersatz evidence | S |
 
-- `documents.csv` و `documents.jsonl`: یک ردیف/رکورد برای هر مدرک گروه‌بندی‌شده.
-- `partner_candidates.csv`: فقط مدارک کامل با status=ready؛ هیچ ارسال خارجی انجام نمی‌شود.
-- `pages.jsonl`: audit استخراج تک‌تک صفحات؛ هنگام اجرا به‌تدریج ذخیره می‌شود.
-- `unresolved_pages.jsonl`: صفحات با اتصال نامعلوم، بدون حذف مقادیر استخراج‌شده.
-- `mrz_crops/`: برش‌های بزرگ‌نمایی‌شده برای بررسی کیفیت OCR.
-- `summary.json`: تعداد صفحات، مدارک، موارد اتصال‌نیافته، ready و مشخصات مدل.
+An ordinary residence permit is not automatically a passport substitute. S does
+not accept every other document. Service/diplomatic passports map to R based on
+the passport-family interpretation; align `TYPE_CODES` in `llm.py` with the partner
+definition if different. Visual kind classification does not authenticate documents.
 
-`ready`: نوع مجاز، شش فیلد موجود و بدون تعارض/خطای تشخیص‌داده‌شده.
-`review`: نقص اطلاعات، نوع نامشخص، تضاد یا شکست LLM.
-`rejected`: نوع مدرک نامجاز.
-ready تضمین دقت صددرصد نیست. اگر LLM قطع شود، مقادیر MRZ در audit باقی می‌مانند.
-اجرای قطع‌شده خودکار resume نمی‌شود؛ audit صفحات تکمیل‌شده محفوظ است.
+## Outputs and debugging
 
-تاریخ به صورت YYMMDD یا UNBEFRISTET صریح ذخیره می‌شود؛ قرن حدس زده نمی‌شود.
-منقضی‌بودن مدرک به‌عنوان شرط تجاری جداگانه اعمال نشده است.
-ملیتِ MRZ کد بدون filler است؛ ملیتِ LLM در صورت نبود کد، متن چاپی خواهد بود.
-قالب دقیق تاریخ/کد ملیت موردنیاز Partner باید پیش از اتصال عملیاتی مشخص شود.
+Each run creates `Extraction/outputs/<timestamp>`. Earlier outputs are retained.
+The pipeline does not consume old grouped CSVs or resume from earlier output files.
+The AXA client retains `cache_prompts=True` from the supplied connection setup.
 
-## فایل‌ها و وابستگی‌ها
+- `documents.csv` and `documents.jsonl`: one row/record per grouped document.
+- `partner_candidates.csv`: documents with status ready; nothing is sent externally.
+- `pages.jsonl`: page audit, written progressively during execution.
+- `unresolved_pages.jsonl`: pages with unresolved document associations.
+- `mrz_crops/`: upscaled crops, separated by processing-page index.
+- `summary.json`: counts and model metadata.
 
-فقط `extract.py` اجرایی است. باقی فایل‌ها توابع کمکی‌اند:
-config.py (مسیرها)، pages.py (metadata)، mrz_morph.py (تصویر)، mrz.py (OCR/Parser)،
-securegpt_client.py (اتصال AXA و آماده‌سازی تصویر)، llm.py (پرامپت استخراج و اعتبارسنجی پاسخ)، documents.py (تجمیع)، test_pipeline.py (تست).
-ماژول تصویر از فایل ارسالی شما اقتباس شده؛ علامت چرخش deskew و حالت تصویر سفید اصلاح شده‌اند.
-از `Life.Extraction` استفاده نمی‌شود.
+Compare each crop with its `mrz.attempts` entry in `pages.jsonl`, which records the
+view label, region, and OCR text. `mrz.parsed` contains the accepted parse;
+`mrz.errors` records failures. `llm_requested_fields` and field sources show fallback.
+Colored overlays are not generated. Crops are saved before adding Tesseract's
+20-pixel white border. Full-page fallback images are not saved, but their OCR text
+is recorded. Pages with no proposed crops may have no crop images.
 
-محیط Pixi قبلاً فعال شما باید Pillow، numpy، OpenCV و کتابخانهٔ axallm
-را داشته باشد. Tesseract executable نیز برای مسیر OCR لازم است؛ می‌توان مسیرش را با
-TESSERACT_CMD تنظیم کرد. هیچ وابستگی یا credential روی سیستم شما خودکار تغییر نمی‌کند.
-تنظیمات مدل، seed، temperature، محدودیت حجم تصویر و retry از اتصال ارسالی شما اقتباس شده‌اند.
-این پایپلاین هیچ import یا وابستگی اجرایی به securegpt_vision.py ندارد؛ نیازی به کپی یا جابه‌جایی آن نیست.
-فایل securegpt_client.py داخل Extraction قرار می‌گیرد و هیچ پرامپت یا schema تشخیص صفحات ندارد.
-پرامپت سیستم و درخواست استخراج در llm.py به آلمانی هستند؛ کلیدهای JSON و مقادیر قراردادی ثابت‌اند.
-متغیرهای محیطی SECUREGPT_MODEL_NAME و SECUREGPT_MODEL_VERSION باید مانند محیط فعال قبلی موجود باشند.
-MODEL_VERSION مانند wrapper ارسالی اعتبارسنجی می‌شود؛ پارامتر جدیدی به سازندهٔ SDK اضافه نشده است.
-تصویر پیش از ارسال بر اساس EXIF جهت‌دهی می‌شود. مسیرهای metadata و تصاویر همچنان در config.py هستند.
+| Status | Meaning |
+|---|---|
+| `ready` | Accepted kind, all six fields present, no detected issues |
+| `review` | Missing fields, unknown kind, conflicts, or extraction issues |
+| `rejected` | Non-accepted document kind |
+
+Ready does not guarantee correctness. MRZ fields survive LLM failure in the audit.
+Interrupted runs do not resume automatically; completed page audit records remain.
+
+Dates use YYMMDD or explicitly printed UNBEFRISTET. Century is not inferred;
+date-format validation uses 2000+YY. Expiration relative to today is not an acceptance
+gate. MRZ nationality is a code without filler; LLM nationality may be printed text.
+Confirm partner date and nationality formats before operational integration.
+
+## Files and environment
+
+| File | Responsibility |
+|---|---|
+| `extract.py` | Extraction entry point |
+| `config.py` | Paths and image-localization settings |
+| `pages.py` | Metadata and image resolution |
+| `mrz_morph.py` | Localization and deskew |
+| `mrz.py` | OCR and strict MRZ parsing |
+| `securegpt_client.py` | AXA connection, image preparation, model/retry settings |
+| `llm.py` | German extraction prompts, response validation, retry loop |
+| `documents.py` | Grouping and field merging |
+| `test_pipeline.py` | Offline tests |
+
+The morphology module is adapted from the supplied code, with corrections for
+deskew rotation direction and blank images. No `Life.Extraction` import is used.
+Use the existing Pixi environment with Pillow, numpy, OpenCV, and axallm.
+Tesseract is needed for OCR; set `TESSERACT_CMD` if its executable is elsewhere.
+No credentials or dependencies on your machine are changed automatically.
+
+`securegpt_client.py` belongs inside Extraction and contains no screening prompt
+or screening schema. Both extraction prompts in `llm.py` are German; fixed JSON
+keys and enum values are unchanged. Images are EXIF-oriented before sending.
+Keep SECUREGPT_MODEL_NAME and SECUREGPT_MODEL_VERSION in the existing environment.
+As in the supplied wrapper, MODEL_VERSION is validated as an environment setting;
+no new SDK constructor argument is assumed.
 
 ```bash
 pixi run python -c "import axallm, cv2; print('imports OK')"
@@ -153,13 +185,17 @@ pixi run python -m unittest discover -s Extraction -p 'test_*.py' -v
 pixi run python Extraction/extract.py
 ```
 
-اگر پروژهٔ شما محیط Pixi نام‌گذاری‌شده دارد، همان `-e NAME` قبلی را استفاده کنید.
+Use the existing `-e NAME` option if your Pixi environment is named.
 
-## اعتبارسنجی انجام‌شده
+## Validation and limitations
 
-تست‌های offline شامل ورودی بدون مسیر، metadata مبهم، استخراج شش فیلد هنگام شکست MRZ،
-حفظ MRZ، اتصال دو سمت، جداسازی دو شماره در یک پرونده، موارد اتصال‌نیافته و برابری JSON/CSV است.
-فراخوانی‌های AXA در تست‌ها mock هستند؛ دسترسی زندهٔ AXA و دقت روی کارت‌های واقعی آزمایش نشده است.
-در آزمون مصنوعی تصویر، deskew کجی ۱۰ درجه را به حدود صفر رساند؛ نواحی MRZ برش خوردند،
-اما خروجی Tesseract همچنان از Parser سخت‌گیر عبور نکرد. این مسیر به fallback کامل می‌رود.
-این نتیجه به معنی تضمین بهبود نرخ MRZ روی دادهٔ واقعی نیست؛ برش‌های ذخیره‌شده برای بررسی آن‌اند.
+The 18 offline tests cover path-free predictions, ambiguous metadata, full LLM
+fallback, MRZ preservation, front/back grouping, distinct document numbers,
+unresolved pages, and JSON/CSV consistency. AXA calls are mocked; live AXA access
+and real-document accuracy have not been tested. The standalone client was also
+checked for image payload generation and independence from the screening module.
+
+In a synthetic check, deskew reduced a 10-degree skew to approximately zero and
+MRZ crops were produced. Tesseract text still failed strict parsing, requiring
+fallback. This does not establish a real-data MRZ success rate; inspect saved crops
+and evaluate representative scans.
