@@ -31,11 +31,15 @@ def key(row):
 
 
 def metadata_rows():
-    files = set(path for path in config.INVENTORY_FILES if path.is_file())
-    for folder in config.DATA_DIRS:
-        files.update(folder.glob("*_page_labels.jsonl"))
-        if (folder / "ab1_pseudo_documents.csv").is_file():
-            files.add(folder / "ab1_pseudo_documents.csv")
+    files = set(config.DATA_DIR.glob("*_page_labels.jsonl"))
+    pseudo = config.DATA_DIR / "ab1_pseudo_documents.csv"
+    if pseudo.is_file():
+        files.add(pseudo)
+    if not files:
+        raise FileNotFoundError(
+            f"No extraction metadata found in {config.DATA_DIR}. Expected "
+            "*_page_labels.jsonl or ab1_pseudo_documents.csv."
+        )
     for path in sorted(files):
         if path.suffix == ".csv":
             yield from read_csv(path)
@@ -75,8 +79,10 @@ def resolve(row, index):
     text = row.get("resolved_image_path") or row.get("image_path")
     if not text:
         paths = {m["image_path"] for m in matches if m.get("image_path")}
-        if len(paths) != 1:
-            raise ValueError(f"Metadata lookup missing/ambiguous for {key(row)}: {len(paths)} paths")
+        if not paths:
+            raise ValueError(f"Metadata lookup found no image path for {key(row)}")
+        if len(paths) > 1:
+            raise ValueError(f"Metadata lookup found {len(paths)} image paths for {key(row)}")
         text = paths.pop()
     path = image_path(text)
     matching = [m for m in matches if m.get("image_path") in {text, str(path)}]

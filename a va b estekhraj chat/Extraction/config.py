@@ -8,10 +8,8 @@ INPUT_CSV = EXTRACTION_DIR / "Input/variant_a_vision_clip_sample_all_test_pages.
 OUTPUT_DIR = EXTRACTION_DIR / "outputs"
 CACHE_DIR = EXTRACTION_DIR / "cache"
 
-# Same metadata formats as the original pipeline.
-DATA_DIRS = [PROJECT_ROOT / "data", EXTRACTION_DIR / "data"]
-INVENTORY_FILES = [PROJECT_ROOT / "outputs/page_inventory.csv",
-                   EXTRACTION_DIR / "Input/page_inventory.csv"]
+# Original extraction metadata. Do not read screening output as page inventory.
+DATA_DIR = PROJECT_ROOT / "data"
 RENDERED_PAGES_DIR = Path.home() / "Projects/life-docai/ausweiskopie_page_detection/Ausweiskopie/RenderedPages"
 IMAGE_ROOTS = [RENDERED_PAGES_DIR, PROJECT_ROOT, PROJECT_ROOT.parent,
                Path.home() / "Projects/life-docai",
