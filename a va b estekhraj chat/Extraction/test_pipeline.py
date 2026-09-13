@@ -126,8 +126,7 @@ class PipelineTests(unittest.TestCase):
             label = root / "corpus_page_labels.jsonl"
             row = {"masterindex_id": "MID", "page_number": 1, "image_path": "a.png", "pdf_path_in_zip": "a.pdf"}
             label.write_text(json.dumps(row) + "\n")
-            with patch.object(config, "DATA_DIRS", [root]), patch.object(config, "INVENTORY_FILES", []), \
-                 patch.object(config, "IMAGE_ROOTS", [root]):
+            with patch.object(config, "METADATA_FILES", [label]), patch.object(config, "IMAGE_ROOTS", [root]):
                 selected = pages.load_pages(prediction)
             self.assertEqual(len(selected), 1)
             self.assertEqual(selected[0]["resolved_image_path"], str(root / "a.png"))
@@ -219,8 +218,9 @@ class PipelineTests(unittest.TestCase):
             (root / "corpus_page_labels.jsonl").write_text("\n".join(json.dumps(row) for row in meta))
             audit = {"parsed": None, "multiple_documents": False, "errors": []}
             self.llm.metadata.return_value = {"model": "fake"}
-            with patch.object(config, "INPUT_CSV", prediction), patch.object(config, "DATA_DIRS", [root]), \
-                 patch.object(config, "INVENTORY_FILES", []), patch.object(config, "IMAGE_ROOTS", [root]), \
+            with patch.object(config, "INPUT_CSV", prediction), \
+                 patch.object(config, "METADATA_FILES", [root / "corpus_page_labels.jsonl"]), \
+                 patch.object(config, "IMAGE_ROOTS", [root]), \
                  patch.object(config, "OUTPUT_DIR", root / "outputs"), \
                  patch.object(config, "CACHE_DIR", root / "cache"), patch("extract.Extractor", return_value=self.llm), \
                  patch("extract.read_mrz", return_value=audit):

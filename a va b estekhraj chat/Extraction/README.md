@@ -15,13 +15,12 @@ Default input: `Extraction/Input/variant_a_vision_clip_sample_all_test_pages.csv
 Required columns: `masterindex_id`, `page_number`, `predicted_page_sst`.
 Only G07 rows are selected. Image paths are not required in this CSV.
 
-Configured metadata sources:
+Metadata sources visible in the existing repository:
 
-- `data/*_page_labels.jsonl`
-- `data/ab1_pseudo_documents.csv`
-- Equivalent files under `Extraction/data`
-- `outputs/page_inventory.csv` under the project root
-- `Extraction/Input/page_inventory.csv`
+- `Data_Preparation/life_prod_s3_export/Life Document Ingestion Pipeline/g07_page_labels.jsonl`
+- `Data_Preparation/life_prod_s3_export/Life Document Ingestion Pipeline/other_page_labels.jsonl`
+- `ausweiskopie_page_detection/outputs/AB1_page_labels.jsonl`
+- `ausweiskopie_page_detection/outputs/ab1_pseudo_documents.csv`
 
 Lookup uses MID and page number; PDF path and image hash, when supplied in the
 prediction row, narrow the match. `source_page_number` is not an automatic
@@ -29,8 +28,10 @@ substitute for `page_number`: metadata and predictions must use consistent page
 numbering. Available metadata is retained. Ambiguous or missing image matches
 are recorded for review. Malformed metadata JSONL raises an explicit error.
 
-All corpus paths are in `config.py`. `PROJECT_ROOT` is the parent of Extraction.
-Adjust `DATA_DIRS`, `INVENTORY_FILES`, and `IMAGE_ROOTS` to the actual server layout.
+All corpus paths are explicit in `config.py`; `PROJECT_ROOT` is the parent of
+Extraction. No `data` directory and no `page_inventory.csv` are assumed. Existing
+metadata files are printed at startup. Adjust `METADATA_FILES` and `IMAGE_ROOTS`
+only if an existing project location changes.
 Legacy image roots from the supplied configuration remain included; their presence
 on your server has not been verified here.
 

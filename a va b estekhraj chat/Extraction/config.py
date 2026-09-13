@@ -8,10 +8,20 @@ INPUT_CSV = EXTRACTION_DIR / "Input/variant_a_vision_clip_sample_all_test_pages.
 OUTPUT_DIR = EXTRACTION_DIR / "outputs"
 CACHE_DIR = EXTRACTION_DIR / "cache"
 
-# Original extraction metadata. Do not read screening output as page inventory.
-DATA_DIR = PROJECT_ROOT / "data"
+# Existing project locations shown in the repository. These are inputs, not new folders.
+INGESTION_DIR = (PROJECT_ROOT / "Data_Preparation" / "life_prod_s3_export"
+                 / "Life Document Ingestion Pipeline")
+AUSWEIS_OUTPUT_DIR = PROJECT_ROOT / "ausweiskopie_page_detection" / "outputs"
+
+METADATA_FILES = [
+    INGESTION_DIR / "g07_page_labels.jsonl",
+    INGESTION_DIR / "other_page_labels.jsonl",
+    AUSWEIS_OUTPUT_DIR / "AB1_page_labels.jsonl",
+    AUSWEIS_OUTPUT_DIR / "ab1_pseudo_documents.csv",
+]
 RENDERED_PAGES_DIR = Path.home() / "Projects/life-docai/ausweiskopie_page_detection/Ausweiskopie/RenderedPages"
-IMAGE_ROOTS = [RENDERED_PAGES_DIR, PROJECT_ROOT, PROJECT_ROOT.parent,
+IMAGE_ROOTS = [RENDERED_PAGES_DIR, INGESTION_DIR, AUSWEIS_OUTPUT_DIR,
+               PROJECT_ROOT, PROJECT_ROOT.parent,
                Path.home() / "Projects/life-docai",
                Path.home() / "Projects/life-docai/ausweiskopie_page_detection",
                Path.home() / "Projects/life-docai/Life Prod S3 export/Life Document Ingestion Pipeline"]

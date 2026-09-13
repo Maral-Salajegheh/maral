@@ -31,23 +31,27 @@ def key(row):
 
 
 def metadata_rows():
-    files = set(config.DATA_DIR.glob("*_page_labels.jsonl"))
-    pseudo = config.DATA_DIR / "ab1_pseudo_documents.csv"
-    if pseudo.is_file():
-        files.add(pseudo)
+    files = [path for path in config.METADATA_FILES if path.is_file()]
     if not files:
         raise FileNotFoundError(
-            f"No extraction metadata found in {config.DATA_DIR}. Expected "
-            "*_page_labels.jsonl or ab1_pseudo_documents.csv."
+            "No extraction metadata file exists. Checked:\n- "
+            + "\n- ".join(str(path) for path in config.METADATA_FILES)
         )
-    for path in sorted(files):
+    for path in files:
+        print(f"Metadata: {path}")
         if path.suffix == ".csv":
-            yield from read_csv(path)
+            rows = read_csv(path)
         else:
+            rows = []
             with path.open(encoding="utf-8") as handle:
-                for line in handle:
+                for line_number, line in enumerate(handle, 1):
                     if line.strip():
-                        yield json.loads(line)
+                        try:
+                            rows.append(json.loads(line))
+                        except json.JSONDecodeError as error:
+                            raise ValueError(f"Invalid JSON in {path}, line {line_number}") from error
+        for row in rows:
+            yield {**row, "_metadata_source": str(path)}
 
 
 def metadata_index():
@@ -87,7 +91,7 @@ def resolve(row, index):
     path = image_path(text)
     matching = [m for m in matches if m.get("image_path") in {text, str(path)}]
     enriched = dict(row)
-    for name in ("pdf_path_in_zip", "source_page_number", "image_sha256"):
+    for name in ("pdf_path_in_zip", "source_page_number", "image_sha256", "_metadata_source"):
         values = {str(m[name]) for m in matching if m.get(name) is not None and str(m[name])}
         if not enriched.get(name) and len(values) == 1:
             enriched[name] = values.pop()
