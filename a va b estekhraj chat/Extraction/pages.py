@@ -91,12 +91,16 @@ def resolve(row, index):
     path = image_path(text)
     matching = [m for m in matches if m.get("image_path") in {text, str(path)}]
     enriched = dict(row)
-    for name in ("pdf_path_in_zip", "source_page_number", "image_sha256", "_metadata_source"):
+    for name in ("pdf_path_in_zip", "source_page_number", "image_sha256"):
         values = {str(m[name]) for m in matching if m.get(name) is not None and str(m[name])}
         if not enriched.get(name) and len(values) == 1:
             enriched[name] = values.pop()
         elif not enriched.get(name) and len(values) > 1:
             raise ValueError(f"Conflicting metadata for {key(row)}: {name}")
+    # The originating filename is audit information, not document data. A page listed in
+    # two metadata files is normal and must not be rejected as contradictory.
+    enriched["_metadata_source"] = sorted({str(m["_metadata_source"]) for m in matching
+                                           if m.get("_metadata_source")})
     return {**enriched, "masterindex_id": key(row)[0], "page_number": key(row)[1],
             "resolved_image_path": str(path)}
 
@@ -118,3 +122,11 @@ def load_pages(input_csv):
             seen.add(identity)
             pages.append(page)
     return pages
+
+
+# cd ~/Projects/life-docai
+# pixi add opencv tesseract
+
+# pixi run python -c "import cv2; print('cv2', cv2.__version__)"
+# pixi run which tesseract || echo "TESSERACT MISSING"
+# pixi run tesseract --version
