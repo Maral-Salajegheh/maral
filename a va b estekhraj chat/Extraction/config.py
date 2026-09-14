@@ -48,3 +48,7 @@ MRZ_OCR_TIMEOUT_SECONDS = 30
 # arrives short. At most this many trailing filler characters are restored before the
 # check digits are applied; nothing is truncated and no glyph is substituted.
 MRZ_MAX_MISSING_FILLER = 8
+
+# Stray marks at the line edges are read as extra characters. At most this many are
+# trimmed, by trying every window of the correct width; the check digits decide.
+MRZ_MAX_EXTRA_CHARS = 4

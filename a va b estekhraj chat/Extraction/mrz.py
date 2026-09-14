@@ -75,17 +75,24 @@ def parse_window(lines, fmt, parser):
 
 
 def padded_variants(line, width):
-    """Restore filler dropped from the end of a fixed-width line.
+    """Ways an OCR line of the wrong length could be the fixed-width MRZ line.
 
-    Tesseract under-reads long runs of identical `<`, so a line arrives a few characters
-    short. MRZ lines are fixed width and right-padded with filler by definition, so the
-    only characters that can be missing from the end are filler. Nothing is truncated,
-    no glyph is substituted, and the check digits still have to pass afterwards.
+    Too short: Tesseract under-reads long runs of identical `<`, and MRZ lines are
+    right-padded with filler by definition, so the missing characters can only be filler.
+    Too long: stray marks at the line edges (card border, specks, the frame) are read as
+    extra characters, so the real line is a window inside what was returned.
+
+    Every variant still has to satisfy the check digits, so a wrong guess is rejected.
+    No glyph is ever substituted.
     """
-    if len(line) == width:
+    extra = len(line) - width
+    if extra == 0:
         return [line]
-    missing = width - len(line)
-    if missing <= 0 or missing > config.MRZ_MAX_MISSING_FILLER:
+    if extra > 0:
+        if extra > config.MRZ_MAX_EXTRA_CHARS:
+            return []
+        return [line[start:start + width] for start in range(extra + 1)]
+    if -extra > config.MRZ_MAX_MISSING_FILLER:
         return []
     variants = [line.ljust(width, "<")]
     # A trailing check digit (TD1 line 2 position 29) keeps its own slot: filler goes
