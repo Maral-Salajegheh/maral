@@ -204,7 +204,11 @@ def scan_rotations(source, directory, audit, debug_dir):
         for index, (crop, region) in enumerate(crops):
             parsed = scan_view(crop, directory, audit, f"rotation_{angle}_crop_{index}", debug_dir, region)
             if parsed:
+                # The candidates are a ranked shortlist. Once one reads as a checksum-valid
+                # MRZ there is nothing to gain from OCRing the rest, and two crops of the
+                # same band can otherwise look like two different documents.
                 found.append(parsed)
+                break
         if not found and not audit["multiple_documents"]:
             parsed = scan_view(page, directory, audit, f"rotation_{angle}_full", debug_dir)
             if parsed:

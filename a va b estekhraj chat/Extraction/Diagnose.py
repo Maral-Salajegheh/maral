@@ -92,19 +92,45 @@ def classify(page):
     return "no_mrz_shaped_text", f"longest OCR lines: {lengths}"
 
 
+# A stored run cannot see a tool installed after it finished; say so rather than
+# letting an old failure look like a current one.
+def stale_run_warning(counts, notes):
+    import shutil
+
+    if not counts.get("no_ocr_attempt"):
+        return
+    missing_then = " ".join(notes)
+    now = []
+    if "tesseract" in missing_then.lower() and shutil.which(config.TESSERACT_CMD):
+        now.append("Tesseract")
+    if "cv2" in missing_then:
+        try:
+            import cv2  # noqa: F401
+
+            now.append("OpenCV")
+        except ImportError:
+            pass
+    if now:
+        print(f"\nNOTE: {' and '.join(now)} is available now but was missing when this run "
+              f"was written. Re-run extract.py and diagnose the new run.")
+
+
 def main():
     run = Path(sys.argv[1]) if len(sys.argv) > 1 else latest_run()
     print(f"Run: {run}\n")
-    counts = Counter()
+    counts, notes = Counter(), []
     for line in (run / "pages.jsonl").read_text(encoding="utf-8").splitlines():
         if not line.strip():
             continue
         page = json.loads(line)
         reason, detail = classify(page)
         counts[reason] += 1
+        if reason == "no_ocr_attempt":
+            notes.append(detail)
         meta = page.get("metadata") or page
         print(f"{meta.get('masterindex_id')} p{meta.get('page_number')}  {reason}"
               + (f"  |  {detail[:110]}" if detail else ""))
+    stale_run_warning(counts, notes)
     print("\nSUMMARY")
     for reason, count in counts.most_common():
         print(f"  {count:4d}  {reason}")
@@ -119,3 +145,14 @@ def main():
 
 if __name__ == "__main__":
     main()
+    
+    
+    
+    
+    
+    cd ~/Projects/life-docai
+unset TESSERACT_CMD
+pixi run bash -c 'echo "[$TESSERACT_CMD]"; tesseract --version | head -1'
+
+
+grep -rn TESSERACT_CMD ~/.bashrc ~/.bash_profile ~/.profile pixi.toml 2>/dev/null

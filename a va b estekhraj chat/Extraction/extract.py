@@ -1,6 +1,7 @@
 """Run from the Pixi project root: pixi run python Extraction/extract.py"""
 import csv
 import json
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -108,8 +109,49 @@ def save_results(output, pages, model):
     print(f"Pages: {len(pages)} | Documents: {len(documents)} | Unresolved: {len(unresolved)} | Ready: {summary['ready']}")
 
 
+# Report the MRZ toolchain up front. Missing OpenCV or Tesseract silently turns every
+# page into an LLM fallback, which looks like an MRZ accuracy problem and is not one.
+def check_mrz_toolchain():
+    import shutil
+    import subprocess
+
+    try:
+        import cv2
+
+        opencv = cv2.__version__
+    except ImportError:
+        opencv = None
+    binary = shutil.which(config.TESSERACT_CMD) or (
+        config.TESSERACT_CMD if Path(config.TESSERACT_CMD).is_file() else None)
+    version = None
+    if binary:
+        try:
+            version = subprocess.run([binary, "--version"], capture_output=True, text=True,
+                                     timeout=10).stdout.splitlines()[0]
+        except Exception as error:
+            version = f"present but unusable: {error}"
+    print(f"OpenCV: {opencv or 'MISSING - no MRZ localisation'}")
+    print(f"Tesseract: {version or 'MISSING - no MRZ OCR, every page will use the LLM'}")
+    return bool(opencv) and bool(version)
+
+
+def page_limit():
+    # Try the MRZ path on a few pages without paying for a whole LLM run.
+    for index, argument in enumerate(sys.argv):
+        if argument == "--limit":
+            return int(sys.argv[index + 1])
+    return None
+
+
 def main():
+    if not check_mrz_toolchain():
+        print("WARNING: the MRZ route is disabled; all six fields will come from the LLM "
+              "with no checksum. Install with: pixi add py-opencv tesseract tesseract-data-eng")
     pages = load_pages(config.INPUT_CSV)
+    limit = page_limit()
+    if limit:
+        pages = pages[:limit]
+        print(f"--limit {limit}: processing the first {len(pages)} pages only")
     if not pages:
         raise ValueError("No G07 pages in the prediction CSV")
     unresolved_images = [page for page in pages if page.get("resolution_error")]
