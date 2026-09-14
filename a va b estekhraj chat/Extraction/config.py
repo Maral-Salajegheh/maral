@@ -10,7 +10,7 @@ CACHE_DIR = EXTRACTION_DIR / "cache"
 
 # Existing project locations shown in the repository. These are inputs, not new folders.
 INGESTION_DIR = (PROJECT_ROOT / "Life Prod S3 export"
-                 / "Life Document Ingestion Pipeline")
+                 / "Life Document Ingestion Pipeline" / "output")
 AUSWEIS_OUTPUT_DIR = PROJECT_ROOT / "ausweiskopie_page_detection" / "outputs"
 
 METADATA_FILES = [
@@ -43,3 +43,8 @@ TESSERACT_CMD = os.getenv("TESSERACT_CMD", "tesseract")
 MRZ_TESSERACT_PSM = "6"
 MRZ_TESSERACT_WHITELIST = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789<"
 MRZ_OCR_TIMEOUT_SECONDS = 30
+
+# Tesseract drops characters from long runs of identical filler, so a fixed-width MRZ line
+# arrives short. At most this many trailing filler characters are restored before the
+# check digits are applied; nothing is truncated and no glyph is substituted.
+MRZ_MAX_MISSING_FILLER = 8

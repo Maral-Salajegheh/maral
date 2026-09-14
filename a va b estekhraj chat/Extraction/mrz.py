@@ -6,7 +6,11 @@ import re
 import subprocess
 import tempfile
 
+from itertools import product
+
 from PIL import Image, ImageDraw, ImageOps
+
+import config
 
 
 def digit(text):
@@ -70,19 +74,49 @@ def parse_window(lines, fmt, parser):
                        "gueltigkeitsdatum": expiry}}
 
 
+def padded_variants(line, width):
+    """Restore filler dropped from the end of a fixed-width line.
+
+    Tesseract under-reads long runs of identical `<`, so a line arrives a few characters
+    short. MRZ lines are fixed width and right-padded with filler by definition, so the
+    only characters that can be missing from the end are filler. Nothing is truncated,
+    no glyph is substituted, and the check digits still have to pass afterwards.
+    """
+    if len(line) == width:
+        return [line]
+    missing = width - len(line)
+    if missing <= 0 or missing > config.MRZ_MAX_MISSING_FILLER:
+        return []
+    variants = [line.ljust(width, "<")]
+    # A trailing check digit (TD1 line 2 position 29) keeps its own slot: filler goes
+    # before it, not after, or every field slice shifts.
+    if line[-1:] not in ("", "<"):
+        variants.append(line[:-1].ljust(width - 1, "<") + line[-1])
+    return variants
+
+
+def window_variants(window, width):
+    per_line = [padded_variants(line, width) for line in window]
+    return product(*per_line) if all(per_line) else []
+
+
 def parse_mrz(text):
-    # Remove OCR whitespace only. Do not pad, truncate, or substitute unknown glyphs.
+    # Remove OCR whitespace only. Do not truncate or substitute unknown glyphs.
     lines = [re.sub(r"\s", "", line.upper()) for line in text.splitlines()]
     found = []
     for fmt, count, width, parser in (("TD1", 3, 30, parse_td1),
                                      ("TD2", 2, 36, parse_td2), ("TD3", 2, 44, parse_td3)):
         for start in range(len(lines) - count + 1):
             window = lines[start:start + count]
-            if not all(len(s) == width and re.fullmatch(r"[A-Z0-9<]+", s) for s in window):
+            if not all(re.fullmatch(r"[A-Z0-9<]+", s) for s in window):
                 continue
-            result = parse_window(window, fmt, parser)
-            if result:
-                found.append(result)
+            for candidate in window_variants(window, width):
+                result = parse_window(list(candidate), fmt, parser)
+                if result:
+                    result["filler_restored"] = list(candidate) != window
+                    result["ocr_lines"] = window
+                    found.append(result)
+                    break
     identities = {tuple(item["fields"].items()) + (("code", item["document_code"]),) for item in found}
     if len(identities) > 1:
         raise ValueError("Several different valid MRZs on one page; split the image first")
