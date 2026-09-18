@@ -27,7 +27,7 @@ from life_docai.utils.snowflake_utils import get_engine
 
 DEFAULT_SCHEMA = "D131_D2D"
 MAPPING_FILE = Path(
-    "/home/shared_folders/life_ai/mid_mapping/mapping_result_process_level_AI.xlsx"
+    "/home/shared_folders/life_ai/mid_mapping/sample_A00_G07_MAD_6000.txt"
 )
 OUTPUT_DIR = Path(__file__).resolve().parent / "output"
 
@@ -68,11 +68,11 @@ def stack_key(value) -> Optional[str]:
 
 
 def parse_int_list(value) -> list[int]:
-    """Parse a comma-separated list of integers; unparseable entries are dropped."""
+    """Pull every integer out of a list cell, whatever separates them."""
     text = clean(value)
     if text is None:
         return []
-    return [int(part) for part in text.split(",") if part.strip().isdigit()]
+    return [int(match) for match in re.findall(r"\d+", text)]
 
 
 # --- mapping file ----------------------------------------------------------
@@ -83,21 +83,68 @@ REQUIRED_COLUMNS = [
 ]
 
 
+SEPARATORS = [",", ";", "\t", "|", ":"]
+ENCODINGS = ["utf-8-sig", "latin-1"]
+
+
+def normalize_columns(data: pd.DataFrame) -> pd.DataFrame:
+    """Lower-case and strip the column names in place."""
+    data.columns = [str(c).strip().lower() for c in data.columns]
+    return data
+
+
+def read_with(path: Path, separator: str, encoding: str,
+              nrows: Optional[int] = None) -> pd.DataFrame:
+    """Read the file with one separator/encoding pair."""
+    return pd.read_csv(path, sep=separator, dtype=str, encoding=encoding,
+                       skipinitialspace=True, low_memory=False, nrows=nrows)
+
+
+def score_separator(path: Path, separator: str, encoding: str) -> int:
+    """How many required columns a separator produces; -1 when it cannot read."""
+    try:
+        sample = normalize_columns(read_with(path, separator, encoding, nrows=5))
+    except Exception:
+        return -1
+    return sum(column in sample.columns for column in REQUIRED_COLUMNS)
+
+
+def detect_format(path: Path) -> tuple[str, str]:
+    """Pick the separator and encoding that recover the most required columns."""
+    best = (-1, None, None)
+    for encoding in ENCODINGS:
+        for separator in SEPARATORS:
+            score = score_separator(path, separator, encoding)
+            if score > best[0]:
+                best = (score, separator, encoding)
+
+    score, separator, encoding = best
+    if score <= 0:
+        raise ValueError(
+            f"Could not parse {path.name}: no separator in {SEPARATORS} "
+            "produced the expected column names. Check the header row."
+        )
+    return separator, encoding
+
+
 def read_mapping_file(path: Path) -> pd.DataFrame:
-    """Read the delivered mapping file (.xlsx or .csv) as text."""
+    """Read the delivered mapping file; the separator is detected for text files."""
     if not path.is_file():
         raise FileNotFoundError(f"Mapping file not found: {path}")
 
     if path.suffix.lower() in {".xlsx", ".xls"}:
-        data = pd.read_excel(path, dtype=str)
+        data = normalize_columns(pd.read_excel(path, dtype=str))
     else:
-        data = pd.read_csv(path, dtype=str, encoding="utf-8-sig",
-                           skipinitialspace=True, low_memory=False)
+        separator, encoding = detect_format(path)
+        print(f"Mapping file separator {separator!r}, encoding {encoding}.")
+        data = normalize_columns(read_with(path, separator, encoding))
 
-    data.columns = [str(c).strip().lower() for c in data.columns]
     missing = [c for c in REQUIRED_COLUMNS if c not in data.columns]
     if missing:
-        raise ValueError(f"Mapping file is missing columns: {missing}")
+        raise ValueError(
+            f"Mapping file is missing columns: {missing}\n"
+            f"Found: {list(data.columns)}"
+        )
     return data
 
 
