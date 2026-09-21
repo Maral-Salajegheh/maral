@@ -38,6 +38,7 @@ PAGE_INVENTORY_PARQUET = (
     / BATCH_ID
     / "page_inventory.parquet"
 )
+RENDER_ROOT = DATASETS_DIR / "AWS_download_ingestion" / "RenderedPages"
 OUTPUT_DIR = MAPPING_DIR / "output"
 PAGE_LABELS_CSV = OUTPUT_DIR / "life_page_labels.csv"
 OCR_CACHE_CSV = OUTPUT_DIR / "life_header_ocr_cache.csv"
@@ -77,6 +78,8 @@ INVENTORY_METADATA = [
     "pdf_sha256",
     "image_path",
     "image_sha256",
+    "render_format",
+    "render_config_version",
     "quality_status",
     "status",
 ]
@@ -163,6 +166,26 @@ def select_mids(pages: pd.DataFrame, limit: Optional[int]) -> pd.DataFrame:
     return pages[pages["masterindex_id"].isin(mids)].copy()
 
 
+def resolve_image_path(row) -> str:
+    """Use the inventory path, rebasing only a stale absolute prefix."""
+    inventory_path = Path(str(row.image_path))
+    if inventory_path.is_file():
+        return str(inventory_path)
+
+    version = getattr(row, "render_config_version", None)
+    if pd.isna(version) or not str(version).strip():
+        version = inventory_path.parent.name
+
+    candidate = (
+        RENDER_ROOT
+        / BATCH_ID
+        / str(row.masterindex_id)
+        / str(version)
+        / inventory_path.name
+    )
+    return str(candidate) if candidate.is_file() else str(inventory_path)
+
+
 def prepare_target_pages(
     pages: pd.DataFrame,
     inventory: pd.DataFrame,
@@ -186,6 +209,14 @@ def prepare_target_pages(
         how="left",
         validate="many_to_one",
     )
+
+    # image_path can contain an absolute prefix from the machine/location where
+    # rendering ran. Keep it for audit, then rebase only that stale prefix onto
+    # the current RenderedPages root; batch/MID/version/filename stay unchanged.
+    selected["inventory_image_path"] = selected["image_path"]
+    selected["image_path"] = [
+        resolve_image_path(row) for row in selected.itertuples()
+    ]
 
     missing_row = selected["image_path"].isna()
     if missing_row.any():
@@ -304,11 +335,10 @@ def pending_rows(
 ) -> list:
     completed = cache[cache["ocr_status"].isin(["success", "empty"])]
     if save_debug_crops:
-        completed = completed[
-            completed["header_crop_path"].fillna("").map(
-                lambda value: bool(value) and Path(value).is_file()
-            )
-        ]
+        crop_exists = completed["header_crop_path"].fillna("").map(
+            lambda value: bool(value) and Path(value).is_file()
+        ).astype(bool)
+        completed = completed.loc[crop_exists]
     done = set(completed[CACHE_KEYS].itertuples(index=False, name=None))
     return [row for row in pages.itertuples() if cache_key(row) not in done]
 
@@ -344,6 +374,10 @@ def run_ocr(
     checkpoint_every: int,
     save_debug_crops: bool,
 ) -> pd.DataFrame:
+    if pages.empty:
+        print("No selected A00 page has an existing rendered image. OCR not started.")
+        return cache
+
     pending = pending_rows(pages, cache, save_debug_crops)
     if not pending:
         print("All available A00 pages are already cached.")
@@ -420,7 +454,9 @@ def merge_page_results(
 ) -> pd.DataFrame:
     metadata = [
         column
-        for column in INVENTORY_METADATA + ["selected_for_ocr", "image_file_exists"]
+        for column in INVENTORY_METADATA + [
+            "inventory_image_path", "selected_for_ocr", "image_file_exists"
+        ]
         if column in selected
     ]
     selected_info = selected[PAGE_KEYS + metadata].drop_duplicates(PAGE_KEYS)
@@ -503,7 +539,8 @@ OUTPUT_COLUMNS = [
     "image_id", "page_number", "source_page_number", "corpus_document_id",
     "corpus_page_id", "corpus_document_page_count", "pdf_path_in_zip",
     "pdf_sha256", "sst", "page_class", "page_class_source", "regex_match",
-    "match_score", "header_text", "header_crop_path", "image_path",
+    "match_score", "header_text", "header_crop_path", "inventory_image_path",
+    "image_path",
     "image_sha256", "quality_status", "ocr_status", "ocr_error",
 ]
 
@@ -551,6 +588,7 @@ def main() -> int:
     inventory = load_page_inventory(PAGE_INVENTORY_PARQUET)
     print(f"Page mapping: {PAGES_CSV}")
     print(f"Page inventory: {PAGE_INVENTORY_PARQUET}")
+    print(f"Current rendered-pages root: {RENDER_ROOT}")
     print(f"Mapping rows: {len(pages):,}")
     print(f"Rendered inventory rows: {len(inventory):,}")
     print(f"MIDs in rendered inventory: {inventory['masterindex_id'].nunique():,}")
