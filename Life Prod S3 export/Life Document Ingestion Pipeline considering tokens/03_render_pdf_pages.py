@@ -117,23 +117,45 @@ def load_pdf_bytes(zip_path: Path) -> dict[str, bytes]:
     return result
 
 
-def load_resumable_rows(previous: Path, image_format: str, render_version: str) -> dict[str, list[dict]]:
-    """Previous rows per document, only for fully successful, same-config documents."""
-    rows = pq.read_table(previous).to_pylist()
-    by_document: dict[str, list[dict]] = {}
-    for row in rows:
-        by_document.setdefault(row["corpus_document_id"], []).append(row)
-    resumable: dict[str, list[dict]] = {}
-    for document_id, doc_rows in by_document.items():
-        complete = all(
-            r["status"] == "success"
-            and r["render_format"] == image_format
-            and r["render_config_version"] == render_version
-            for r in doc_rows
-        ) and len(doc_rows) == doc_rows[0]["corpus_document_page_count"]
-        if complete:
-            resumable[document_id] = doc_rows
-    return resumable
+def already_rendered(document: dict, batch_id: str, args: argparse.Namespace) -> bool:
+    """True if every page of this document already exists on disk for this
+    render version. Lets a re-run skip work even when a previous run was
+    interrupted before writing the inventory."""
+    extension = "jpg" if args.format == "jpeg" else "png"
+    page_dir = RENDER_ROOT / batch_id / document["masterindex_id"] / args.render_version
+    if not page_dir.is_dir():
+        return False
+    page_count = document["corpus_page_count"]
+    if not page_count:
+        return False
+    for page_number in range(1, page_count + 1):
+        if not (page_dir / f"page_{page_number:04d}.{extension}").is_file():
+            return False
+    return True
+
+
+def rebuild_rows_from_disk(document: dict, batch_id: str, args: argparse.Namespace) -> list[dict]:
+    """Reconstruct page rows for a document whose images are already on disk,
+    so the inventory is complete without re-rendering."""
+    extension = "jpg" if args.format == "jpeg" else "png"
+    page_dir = RENDER_ROOT / batch_id / document["masterindex_id"] / args.render_version
+    records: list[dict] = []
+    for page_number in range(1, document["corpus_page_count"] + 1):
+        image_path = page_dir / f"page_{page_number:04d}.{extension}"
+        image_bytes = image_path.read_bytes()
+        with Image.open(image_path) as img:
+            width, height = img.size
+        record = new_page_record(document, batch_id, args)
+        record["corpus_page_id"] = stable_sha256(document["corpus_document_id"], page_number)
+        record["source_page_number"] = page_number
+        record["image_path"] = str(image_path)
+        record["image_sha256"] = hashlib.sha256(image_bytes).hexdigest()
+        record["image_width_px"] = width
+        record["image_height_px"] = height
+        record["image_size_bytes"] = len(image_bytes)
+        record["status"] = "success"
+        records.append(record)
+    return records
 
 
 def new_page_record(document: dict, batch_id: str, args: argparse.Namespace) -> dict:
@@ -261,24 +283,19 @@ def main() -> None:
         raise RuntimeError("Document inventory contains no renderable documents.")
 
     output_path = LOCAL_OUTPUT_ROOT / batch_id / "page_inventory.parquet"
-    resumable: dict[str, list[dict]] = {}
-    if output_path.is_file() and not args.no_resume:
-        resumable = load_resumable_rows(output_path, args.format, args.render_version)
-        current_hash = {d["corpus_document_id"]: d["pdf_sha256"] for d in documents}
-        resumable = {
-            doc_id: rows
-            for doc_id, rows in resumable.items()
-            if doc_id in current_hash and rows[0]["pdf_sha256"] == current_hash[doc_id]
-        }
-        if resumable:
-            print(f"Resuming: skipping {len(resumable)} completed documents.")
+    resume = not args.no_resume
 
     pdf_map = load_pdf_bytes(zip_path)
     records: list[dict] = []
-    for document in documents:
-        if document["corpus_document_id"] in resumable:
-            records.extend(resumable[document["corpus_document_id"]])
+    skipped = 0
+    for index, document in enumerate(documents, start=1):
+        # Skip documents whose images are all already on disk (survives an
+        # interrupted previous run, which may never have written the inventory).
+        if resume and already_rendered(document, batch_id, args):
+            records.extend(rebuild_rows_from_disk(document, batch_id, args))
+            skipped += 1
             continue
+
         pdf_bytes = pdf_map.get(document["pdf_path_in_zip"])
         if pdf_bytes is None:
             record = new_page_record(document, batch_id, args)
@@ -288,6 +305,14 @@ def main() -> None:
             records.append(record)
             continue
         records.extend(render_document(document, pdf_bytes, batch_id, args))
+
+        # Write the inventory periodically so progress survives an interruption.
+        if index % 200 == 0:
+            write_parquet_records(output_path, records, PAGE_SCHEMA)
+            print(f"  ...{index}/{len(documents)} documents processed")
+
+    if skipped:
+        print(f"Resumed: {skipped} documents already rendered on disk were skipped.")
 
     write_parquet_records(output_path, records, PAGE_SCHEMA)
     print(f"Page inventory: {output_path}")
