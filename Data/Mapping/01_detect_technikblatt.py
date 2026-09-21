@@ -18,6 +18,7 @@ import argparse
 import re
 import tempfile
 from collections import defaultdict
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Optional
 
@@ -26,19 +27,23 @@ from PIL import Image, ImageOps
 
 
 MAPPING_DIR = Path(__file__).resolve().parent
-PROJECT_ROOT = MAPPING_DIR.parents[2]
+DATASETS_DIR = MAPPING_DIR.parent
 
 PAGES_CSV = MAPPING_DIR / "output" / "life_mid_pages.csv"
-RENDER_ROOT = PROJECT_ROOT / "AWS_download_ingestion" / "RenderedPages"
+RENDER_ROOT = DATASETS_DIR / "AWS_download_ingestion" / "RenderedPages"
 OUTPUT_DIR = MAPPING_DIR / "output"
 
 PAGE_LABELS_CSV = OUTPUT_DIR / "life_page_labels.csv"
 OCR_CACHE_CSV = OUTPUT_DIR / "life_header_ocr_cache.csv"
 DOCUMENT_REPORT_CSV = OUTPUT_DIR / "life_tb0_documents.csv"
+DEBUG_CROP_DIR = OUTPUT_DIR / "technikblatt_header_crops"
 
 TARGET_SST = "A00"
-OCR_ENGINE = "RapidOCR"
-HEADER_RATIO = 0.25
+OCR_ENGINE = "RapidOCR-header-v2"
+HEADER_RATIO = 0.35
+UPSCALE_FACTOR = 2
+KEYWORD = "technikblatt"
+FUZZY_THRESHOLD = 0.85
 CHECKPOINT_EVERY = 100
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".tif", ".tiff"}
 KEYWORD_PATTERN = re.compile(r"\btechnik[\s_-]*blatt\b", re.IGNORECASE)
@@ -53,6 +58,7 @@ CACHE_KEY_COLUMNS = [
 ]
 CACHE_COLUMNS = CACHE_KEY_COLUMNS + [
     "header_text",
+    "header_crop_path",
     "ocr_status",
     "ocr_error",
 ]
@@ -167,12 +173,22 @@ def attach_image_paths(
 
 
 def crop_header(image_path: Path, ratio: float) -> Image.Image:
-    """Crop the top part of a rendered page."""
+    """Crop, enlarge, and improve the top part of a rendered page."""
     with Image.open(image_path) as source:
         image = ImageOps.exif_transpose(source).convert("L")
         width, height = image.size
         header = image.crop((0, 0, width, max(1, int(height * ratio))))
-    return ImageOps.autocontrast(header)
+    header = ImageOps.autocontrast(header)
+    return header.resize(
+        (header.width * UPSCALE_FACTOR, header.height * UPSCALE_FACTOR),
+        Image.Resampling.LANCZOS,
+    )
+
+
+def debug_crop_path(row) -> Path:
+    """Build a readable debug path for one cropped header."""
+    masterindex_id = re.sub(r"[^A-Za-z0-9_.-]", "_", str(row.masterindex_id))
+    return DEBUG_CROP_DIR / masterindex_id / f"{Path(row.image_path).stem}_header.png"
 
 
 def create_ocr():
@@ -206,10 +222,19 @@ def run_rapidocr(image: Image.Image, engine) -> str:
     return " ".join(texts)
 
 
-def ocr_header(image_path: Path, ratio: float, engine) -> tuple[str, str, Optional[str]]:
+def ocr_header(
+    image_path: Path,
+    ratio: float,
+    engine,
+    crop_path: Optional[Path],
+) -> tuple[str, str, Optional[str]]:
     """Return normalized text, status, and an optional error."""
     try:
-        text = run_rapidocr(crop_header(image_path, ratio), engine)
+        header = crop_header(image_path, ratio)
+        if crop_path is not None:
+            crop_path.parent.mkdir(parents=True, exist_ok=True)
+            header.save(crop_path)
+        text = run_rapidocr(header, engine)
     except Exception as error:
         return "", "failed", str(error)
 
@@ -260,23 +285,36 @@ def cache_key(row) -> tuple:
     return tuple(getattr(row, column) for column in CACHE_KEY_COLUMNS)
 
 
-def pending_rows(pages: pd.DataFrame, cache: pd.DataFrame) -> list:
+def pending_rows(
+    pages: pd.DataFrame,
+    cache: pd.DataFrame,
+    save_debug_crops: bool,
+) -> list:
     """Return pages that were not successfully completed before."""
     completed = cache[cache["ocr_status"].isin(["success", "empty"])]
+    if save_debug_crops:
+        completed = completed[
+            completed["header_crop_path"].fillna("").map(
+                lambda value: bool(value) and Path(value).is_file()
+            )
+        ]
     done = set(completed[CACHE_KEY_COLUMNS].itertuples(index=False, name=None))
     return [row for row in pages.itertuples() if cache_key(row) not in done]
 
 
-def cache_record(row, engine) -> dict:
+def cache_record(row, engine, save_debug_crops: bool) -> dict:
     """OCR one page and return one cache record."""
+    crop_path = debug_crop_path(row) if save_debug_crops else None
     text, status, error = ocr_header(
         Path(row.image_path),
         float(row.header_ratio),
         engine,
+        crop_path,
     )
     record = {column: getattr(row, column) for column in CACHE_KEY_COLUMNS}
     record.update(
         header_text=text,
+        header_crop_path=str(crop_path) if crop_path else "",
         ocr_status=status,
         ocr_error=error,
     )
@@ -299,9 +337,10 @@ def run_ocr(
     pages: pd.DataFrame,
     cache: pd.DataFrame,
     checkpoint_every: int,
+    save_debug_crops: bool,
 ) -> pd.DataFrame:
     """OCR pending pages and checkpoint progress for safe resume."""
-    pending = pending_rows(pages, cache)
+    pending = pending_rows(pages, cache, save_debug_crops)
     if not pending:
         print("All available A00 pages are already cached.")
         return cache
@@ -312,7 +351,7 @@ def run_ocr(
 
     try:
         for number, row in enumerate(pending, start=1):
-            records.append(cache_record(row, engine))
+            records.append(cache_record(row, engine, save_debug_crops))
             if number % checkpoint_every == 0:
                 cache = save_cache(cache, records)
                 records.clear()
@@ -324,12 +363,26 @@ def run_ocr(
     return save_cache(cache, records)
 
 
-def keyword_match(text) -> Optional[str]:
-    """Return the matched Technikblatt spelling, if present."""
+def keyword_match(text) -> tuple[Optional[str], float]:
+    """Find exact or slightly misread versions of Technikblatt."""
     if not isinstance(text, str):
-        return None
+        return None, 0.0
+
     match = KEYWORD_PATTERN.search(text)
-    return match.group(0) if match else None
+    if match:
+        return match.group(0), 1.0
+
+    words = re.findall(r"[a-z]+", text.casefold())
+    candidates = words + [words[index] + words[index + 1] for index in range(len(words) - 1)]
+    if not candidates:
+        return None, 0.0
+
+    candidate = max(
+        candidates,
+        key=lambda value: SequenceMatcher(None, value, KEYWORD).ratio(),
+    )
+    score = SequenceMatcher(None, candidate, KEYWORD).ratio()
+    return (candidate, score) if score >= FUZZY_THRESHOLD else (None, score)
 
 
 def label_target_pages(
@@ -337,20 +390,30 @@ def label_target_pages(
     cache: pd.DataFrame,
 ) -> pd.DataFrame:
     """Assign TB0 when RapidOCR text contains Technikblatt."""
-    values = CACHE_KEY_COLUMNS + ["header_text", "ocr_status", "ocr_error"]
+    values = CACHE_KEY_COLUMNS + [
+        "header_text",
+        "header_crop_path",
+        "ocr_status",
+        "ocr_error",
+    ]
     labelled = available.merge(
         cache[values],
         on=CACHE_KEY_COLUMNS,
         how="left",
         validate="many_to_one",
     )
-    labelled["regex_match"] = labelled["header_text"].map(keyword_match)
+    matches = labelled["header_text"].map(keyword_match)
+    labelled[["regex_match", "match_score"]] = pd.DataFrame(
+        matches.tolist(),
+        index=labelled.index,
+    )
     labelled["page_class"] = TARGET_SST
     labelled["page_class_source"] = "MAPPING"
 
     matched = labelled["regex_match"].notna()
     labelled.loc[matched, "page_class"] = "TB0"
-    labelled.loc[matched, "page_class_source"] = "OCR_REGEX"
+    labelled.loc[matched & labelled["match_score"].eq(1.0), "page_class_source"] = "OCR_EXACT"
+    labelled.loc[matched & labelled["match_score"].lt(1.0), "page_class_source"] = "OCR_FUZZY"
     return labelled
 
 
@@ -366,7 +429,9 @@ def merge_page_results(
         "page_class",
         "page_class_source",
         "regex_match",
+        "match_score",
         "header_text",
+        "header_crop_path",
         "ocr_status",
         "ocr_error",
     ]
@@ -389,29 +454,39 @@ def merge_page_results(
 
 
 def build_document_report(labels: pd.DataFrame) -> pd.DataFrame:
-    """Summarize documents containing at least one TB0 page."""
-    tb0 = labels[labels["page_class"].eq("TB0")]
+    """Summarize only document groups that were actually OCR-scanned."""
     keys = ["stack_id", "process_id", "doc_id", "subdoc_idx", "masterindex_id"]
+    attempted = labels["ocr_status"].isin(["success", "empty", "failed"])
+    scanned = labels[attempted].copy()
 
-    if tb0.empty:
-        return pd.DataFrame(columns=keys + ["n_tb0_pages"])
+    if scanned.empty:
+        return pd.DataFrame(columns=keys + ["n_scanned_pages", "n_tb0_pages"])
 
-    report = tb0.groupby(keys, dropna=False).agg(
-        n_tb0_pages=("image_id", "size"),
-        tb0_image_ids=("image_id", lambda values: ",".join(map(str, values))),
-        tb0_page_numbers=("page_number", lambda values: ",".join(map(str, values))),
+    scanned["is_tb0"] = scanned["page_class"].eq("TB0")
+    scanned["tb0_image_id"] = scanned["image_id"].where(scanned["is_tb0"])
+    scanned["tb0_page_number"] = scanned["page_number"].where(scanned["is_tb0"])
+
+    report = scanned.groupby(keys, dropna=False).agg(
+        n_scanned_pages=("image_id", "size"),
+        n_tb0_pages=("is_tb0", "sum"),
+        tb0_image_ids=("tb0_image_id", lambda values: ",".join(map(str, values.dropna()))),
+        tb0_page_numbers=("tb0_page_number", lambda values: ",".join(map(str, values.dropna()))),
     ).reset_index()
 
-    totals = (
+    document_totals = (
         labels.groupby(keys, dropna=False)
         .size()
-        .rename("n_document_pages")
+        .rename("n_document_input_pages")
         .reset_index()
     )
-    report = report.merge(totals, on=keys, how="left")
-    report["whole_document_is_tb0"] = (
-        report["n_tb0_pages"] == report["n_document_pages"]
+    mid_totals = (
+        labels.groupby("masterindex_id", dropna=False)
+        .size()
+        .rename("n_mid_input_pages")
+        .reset_index()
     )
+    report = report.merge(document_totals, on=keys, how="left")
+    report = report.merge(mid_totals, on="masterindex_id", how="left")
     return report
 
 
@@ -428,7 +503,9 @@ OUTPUT_COLUMNS = [
     "page_class",
     "page_class_source",
     "regex_match",
+    "match_score",
     "header_text",
+    "header_crop_path",
     "image_path",
     "ocr_status",
     "ocr_error",
@@ -450,7 +527,17 @@ def print_report(labels: pd.DataFrame, documents: pd.DataFrame) -> None:
     print("\nOCR status:")
     print(labels["ocr_status"].fillna("unknown").value_counts().to_string())
     print(f"\nTB0 pages: {int(labels['page_class'].eq('TB0').sum()):,}")
-    print(f"Documents containing TB0: {len(documents):,}")
+    print(f"Scanned document groups: {len(documents):,}")
+    print(f"Document groups containing TB0: {int(documents['n_tb0_pages'].gt(0).sum()):,}")
+
+
+def select_mids(available: pd.DataFrame, limit: Optional[int]) -> pd.DataFrame:
+    """For tests, select complete MIDs instead of unrelated individual pages."""
+    if limit is None:
+        return available
+
+    selected = available["masterindex_id"].drop_duplicates().head(limit)
+    return available[available["masterindex_id"].isin(selected)].copy()
 
 
 def parse_args() -> argparse.Namespace:
@@ -471,7 +558,12 @@ def parse_args() -> argparse.Namespace:
         "--limit",
         type=int,
         default=None,
-        help="OCR only the first N available A00 pages for a test run.",
+        help="OCR all available A00 pages belonging to the first N MasterIndex IDs.",
+    )
+    parser.add_argument(
+        "--save-debug-crops",
+        action="store_true",
+        help="Save the exact enlarged header crops sent to RapidOCR.",
     )
     return parser.parse_args()
 
@@ -490,12 +582,19 @@ def main() -> int:
     print(f"Rendered pages root: {RENDER_ROOT}")
 
     all_target, available = prepare_target_pages(pages, args.header_ratio)
-    if args.limit is not None:
-        available = available.head(args.limit)
-    print(f"A00 pages available for OCR: {len(available):,}")
+    available = select_mids(available, args.limit)
+    selected_mid_count = available["masterindex_id"].nunique()
+    print(f"MasterIndex IDs selected: {selected_mid_count:,}")
+    print(f"A00 pages selected for OCR: {len(available):,}")
 
     cache = load_cache(OCR_CACHE_CSV)
-    cache = run_ocr(available, cache, args.checkpoint_every)
+    save_debug_crops = args.save_debug_crops or args.limit is not None
+    cache = run_ocr(
+        available,
+        cache,
+        args.checkpoint_every,
+        save_debug_crops,
+    )
     labelled = label_target_pages(available, cache)
     labels = merge_page_results(pages, all_target, labelled)
     documents = build_document_report(labels)
@@ -505,6 +604,8 @@ def main() -> int:
     print(f"\nPage labels: {PAGE_LABELS_CSV}")
     print(f"TB0 documents: {DOCUMENT_REPORT_CSV}")
     print(f"OCR cache: {OCR_CACHE_CSV}")
+    if save_debug_crops:
+        print(f"Header crops: {DEBUG_CROP_DIR}")
     return 0
 
 
