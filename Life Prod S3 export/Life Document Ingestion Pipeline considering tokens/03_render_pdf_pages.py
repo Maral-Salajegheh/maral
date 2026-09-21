@@ -323,3 +323,12 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+    
+    
+    
+    cd ~/Projects/life-docai/Atrag/Datasets/AWS_download_ingestion
+
+LOCAL_TEMP_ROOT=/home/shared_folders/life_ai/life-document-ai-temp \
+pixi run python run_pipeline.py \
+  --batch-id life_20260918_A00_G07_MAD_6000_sample_MID \
+  --from-stage 03
