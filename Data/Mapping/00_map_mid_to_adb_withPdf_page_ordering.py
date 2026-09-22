@@ -8,10 +8,10 @@ verified document class in sfdoc_class. A page is labelled TB0 when its
 sfdoc_class contains "Technikblatt"; otherwise its existing SST is retained.
 
 The PDF page of each row inside its stack PDF is computed with the rule
-verified on real documents: when the doc_id changes and seqno restarts at 1,
-the new document starts right after all pages delivered before it in the
-stack. The rule needs the rows in the order Snowflake returns them, so it runs
-before any sorting.
+verified on real documents: a document starts right after all pages of the
+documents delivered before it in the stack, and seqno gives the position
+inside the document. Documents are ordered by where their first row appears in
+the Snowflake result, so the rule runs before any sorting.
 
 Run from life-docai/Antrag/Datasets/Mapping:
 
@@ -308,32 +308,35 @@ def prepare_page_labels(data: pd.DataFrame) -> pd.DataFrame:
 # PDF page inside the stack PDF
 # ---------------------------------------------------------------------------
 
-def stack_pdf_pages(stack: pd.DataFrame) -> list[int]:
-    """Apply the verified rule to one stack's rows in delivery order: a new
-    doc_id (seqno 1) starts right after all pages delivered before it."""
-    pages = []
-    start, rows_seen = 1, 0
-    for seqno in stack["seqno_num"]:
-        if seqno == 1:
-            start = rows_seen + 1
-        pages.append(start + int(seqno) - 1)
-        rows_seen += 1
-    return pages
+def document_offsets(pages: pd.DataFrame) -> pd.DataFrame:
+    """Pages before each document in its stack.
+
+    Documents are ordered by where their first row appears in the delivery.
+    Each document starts after the full page count of the documents before it,
+    even when a document's rows are split in the delivery.
+    """
+    documents = (
+        pages.groupby(DOCUMENT_KEYS, dropna=False)
+        .agg(first_row=("delivery_row", "min"), n_doc_pages=("image_id", "size"))
+        .reset_index()
+        .sort_values(["stack_id_key", "first_row"])
+    )
+    documents["pages_before"] = (
+        documents.groupby("stack_id_key")["n_doc_pages"].cumsum()
+        - documents["n_doc_pages"]
+    )
+    return documents[DOCUMENT_KEYS + ["pages_before"]]
 
 
 def add_stack_pdf_page(pages: pd.DataFrame) -> pd.DataFrame:
-    """Add stack_pdf_page and flag positions claimed by more than one row."""
-    pages = pages.sort_values(["stack_id_key", "delivery_row"]).copy()
-    result = []
-    for _, stack in pages.groupby("stack_id_key", sort=False):
-        result.extend(stack_pdf_pages(stack))
-
-    pages["stack_pdf_page"] = result
+    """PDF page = pages of all earlier documents in the stack + seqno."""
+    pages = pages.merge(document_offsets(pages), on=DOCUMENT_KEYS, how="left")
+    pages["stack_pdf_page"] = (pages["pages_before"] + pages["seqno_num"]).astype("Int64")
     pages["stack_pdf_page_duplicate"] = pages.duplicated(
         ["stack_id_key", "stack_pdf_page"],
         keep=False,
     )
-    return pages.reset_index(drop=True)
+    return pages.drop(columns=["pages_before"]).reset_index(drop=True)
 
 
 # ---------------------------------------------------------------------------
