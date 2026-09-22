@@ -1,19 +1,23 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-"""
-Join the MasterIndex file to Analyse-DB page labels.
+"""Map the delivered MasterIndex sample to final Analyse-DB page labels.
 
-The MasterIndex file has one row per document: stackID, DocID, SubDocId, SST,
-MasterindexID. It carries no pages. Analyse-DB knows which image_ids belong to
-each document and in which order (seqno), so joining the two gives, per
-document, the image_ids in document order and a page number 1..N.
+TB0 is not detected with OCR.  The final page table already carries the
+verified document class in sfdoc_class.  A page is labelled TB0 when its
+sfdoc_class contains "Technikblatt"; otherwise its existing SST is retained.
 
-That is the mapping_result_process_level table, and the page-level rows under
-it are the training-label seed.
+Run from life-docai/Antrag/Datasets/Mapping:
 
-    python 00_map_mid_to_adb.py --schema D131_D2D
-    python 00_map_mid_to_adb.py --schema D131_D2D --publish-snowflake
+    pixi run -e dev python 00_map_mid_to_adb.py --schema D131_D2D
+
+Outputs are written to the existing Mapping/output directory:
+
+    life_mid_documents.csv
+    life_mid_documents.parquet
+    life_mid_pages.csv
+    life_mid_pages.parquet
+    life_mid_summary.csv
 """
 
 from __future__ import annotations
@@ -45,33 +49,37 @@ PAGES_PARQUET = OUTPUT_DIR / "life_mid_pages.parquet"
 SUMMARY_CSV = OUTPUT_DIR / "life_mid_summary.csv"
 
 OK = "OK"
+TB0 = "TB0"
 
 
-# --- helpers ---------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# General helpers
+# ---------------------------------------------------------------------------
 
 def validate_identifier(value: str) -> str:
-    """Allow only unquoted Snowflake identifiers."""
+    """Allow only safe unquoted Snowflake identifiers."""
     if not re.fullmatch(r"[A-Za-z0-9_]+", value):
         raise ValueError(f"Unsafe Snowflake identifier: {value!r}")
     return value.upper()
 
 
 def clean(value) -> Optional[str]:
-    """Stripped text, or None if empty."""
+    """Return stripped text, or None for an empty value."""
     if pd.isna(value):
         return None
     text = str(value).strip()
-    return None if text == "" or text.lower() in {"nan", "none", "null"} else text
+    if not text or text.lower() in {"nan", "none", "null"}:
+        return None
+    return text
 
 
 def stack_key(value) -> Optional[str]:
-    """Case-insensitive stack_id join key."""
     text = clean(value)
     return None if text is None else text.lower()
 
 
 def id_key(value) -> Optional[str]:
-    """Join key for doc_id / subdoc_idx, which may be zero-padded on one side."""
+    """Normalize zero-padded document identifiers for joining only."""
     text = clean(value)
     if text is None:
         return None
@@ -79,14 +87,23 @@ def id_key(value) -> Optional[str]:
 
 
 def upper_or_none(value) -> Optional[str]:
-    """Upper-case code, or None."""
     text = clean(value)
     return None if text is None else text.upper()
 
 
-# --- MasterIndex file ------------------------------------------------------
+def first_non_null(values: pd.Series):
+    values = values.dropna()
+    return values.iloc[0] if not values.empty else None
 
-# The delivered header uses its own spelling; map it onto our names.
+
+def join_text(values: pd.Series) -> str:
+    return ",".join(str(value) for value in values.dropna())
+
+
+# ---------------------------------------------------------------------------
+# MasterIndex input file
+# ---------------------------------------------------------------------------
+
 COLUMN_ALIASES = {
     "stackid": "stack_id",
     "stack_id": "stack_id",
@@ -98,77 +115,90 @@ COLUMN_ALIASES = {
     "masterindexid": "masterindex_id",
     "masterindex_id": "masterindex_id",
 }
-REQUIRED_COLUMNS = ["stack_id", "doc_id", "subdoc_idx", "mid_sst", "masterindex_id"]
-
+REQUIRED_MAPPING_COLUMNS = [
+    "stack_id",
+    "doc_id",
+    "subdoc_idx",
+    "mid_sst",
+    "masterindex_id",
+]
 SEPARATORS = [",", ";", "\t", "|", ":"]
 ENCODINGS = ["utf-8-sig", "latin-1"]
 
 
-def rename_columns(data: pd.DataFrame) -> pd.DataFrame:
-    """Lower-case the headers and map the delivered names onto ours."""
-    data.columns = [str(c).strip().lower() for c in data.columns]
+def rename_mapping_columns(data: pd.DataFrame) -> pd.DataFrame:
+    data = data.copy()
+    data.columns = [str(column).strip().lower() for column in data.columns]
     return data.rename(columns=COLUMN_ALIASES)
 
 
-def read_with(path: Path, separator: str, encoding: str,
-              nrows: Optional[int] = None) -> pd.DataFrame:
-    """Read the file with one separator/encoding pair."""
-    return pd.read_csv(path, sep=separator, dtype=str, encoding=encoding,
-                       skipinitialspace=True, low_memory=False, nrows=nrows)
+def read_with(
+    path: Path,
+    separator: str,
+    encoding: str,
+    nrows: Optional[int] = None,
+) -> pd.DataFrame:
+    return pd.read_csv(
+        path,
+        sep=separator,
+        dtype=str,
+        encoding=encoding,
+        skipinitialspace=True,
+        low_memory=False,
+        nrows=nrows,
+    )
 
 
-def score_separator(path: Path, separator: str, encoding: str) -> int:
-    """How many required columns a separator recovers; -1 when it cannot read."""
-    try:
-        sample = rename_columns(read_with(path, separator, encoding, nrows=5))
-    except Exception:
-        return -1
-    return sum(column in sample.columns for column in REQUIRED_COLUMNS)
+def detect_text_format(path: Path) -> tuple[str, str]:
+    """Find the separator and encoding that recover the expected header."""
+    best_score = -1
+    best_separator = None
+    best_encoding = None
 
-
-def detect_format(path: Path) -> tuple[str, str]:
-    """Pick the separator and encoding that recover the most required columns."""
-    best = (-1, None, None)
     for encoding in ENCODINGS:
         for separator in SEPARATORS:
-            score = score_separator(path, separator, encoding)
-            if score > best[0]:
-                best = (score, separator, encoding)
+            try:
+                sample = rename_mapping_columns(
+                    read_with(path, separator, encoding, nrows=5)
+                )
+                score = sum(
+                    column in sample.columns
+                    for column in REQUIRED_MAPPING_COLUMNS
+                )
+            except Exception:
+                score = -1
 
-    score, separator, encoding = best
-    if score <= 0:
+            if score > best_score:
+                best_score = score
+                best_separator = separator
+                best_encoding = encoding
+
+    if best_score <= 0 or best_separator is None or best_encoding is None:
         raise ValueError(
-            f"Could not parse {path.name}: no separator in {SEPARATORS} produced "
-            f"the expected columns {REQUIRED_COLUMNS}. Check the header row."
+            f"Could not parse {path.name}. Expected columns: "
+            f"{REQUIRED_MAPPING_COLUMNS}"
         )
-    return separator, encoding
+    return best_separator, best_encoding
 
 
-def read_mapping_file(path: Path) -> pd.DataFrame:
-    """Read the MasterIndex file; the separator is detected for text files."""
+def load_mapping(path: Path) -> pd.DataFrame:
+    """Load the delivered sample and create normalized join keys."""
     if not path.is_file():
-        raise FileNotFoundError(f"MasterIndex file not found: {path}")
+        raise FileNotFoundError(f"MasterIndex mapping file not found: {path}")
 
     if path.suffix.lower() in {".xlsx", ".xls"}:
-        data = rename_columns(pd.read_excel(path, dtype=str))
+        data = rename_mapping_columns(pd.read_excel(path, dtype=str))
     else:
-        separator, encoding = detect_format(path)
+        separator, encoding = detect_text_format(path)
         print(f"MasterIndex separator {separator!r}, encoding {encoding}.")
-        data = rename_columns(read_with(path, separator, encoding))
+        data = rename_mapping_columns(read_with(path, separator, encoding))
 
-    missing = [c for c in REQUIRED_COLUMNS if c not in data.columns]
+    missing = set(REQUIRED_MAPPING_COLUMNS) - set(data.columns)
     if missing:
-        raise ValueError(
-            f"MasterIndex file is missing columns: {missing}\n"
-            f"Found: {list(data.columns)}"
-        )
-    return data
+        raise ValueError(f"MasterIndex file is missing columns: {sorted(missing)}")
 
-
-def prepare_mapping(data: pd.DataFrame) -> pd.DataFrame:
-    """Clean the keys and build the join keys."""
-    data = data[REQUIRED_COLUMNS].copy()
-    for column in REQUIRED_COLUMNS:
+    data = data[REQUIRED_MAPPING_COLUMNS].copy()
+    for column in REQUIRED_MAPPING_COLUMNS:
         data[column] = data[column].map(clean)
 
     data["stack_id_key"] = data["stack_id"].map(stack_key)
@@ -178,203 +208,175 @@ def prepare_mapping(data: pd.DataFrame) -> pd.DataFrame:
     return data.drop_duplicates().reset_index(drop=True)
 
 
-def load_mapping(path: Path) -> pd.DataFrame:
-    """Read and prepare the MasterIndex file."""
-    return prepare_mapping(read_mapping_file(path))
+# ---------------------------------------------------------------------------
+# Final Analyse-DB page labels
+# ---------------------------------------------------------------------------
+
+DOCUMENT_KEYS = [
+    "stack_id_key",
+    "process_id",
+    "doc_id_key",
+    "subdoc_idx_key",
+]
+MAPPING_JOIN_KEYS = ["stack_id_key", "doc_id_key", "subdoc_idx_key"]
 
 
-# --- Analyse-DB page labels ------------------------------------------------
+def load_page_labels(
+    engine: sqlalchemy.Engine,
+    schema: str,
+    stack_ids: list[str],
+) -> pd.DataFrame:
+    """Read final page rows only for stacks present in the input sample."""
+    if not stack_ids:
+        raise ValueError("The MasterIndex mapping contains no usable stack_id.")
 
-def load_page_labels(engine: sqlalchemy.Engine, schema: str) -> pd.DataFrame:
-    """Read every final export page with its document key and order."""
-    query = sqlalchemy.text(f"""
-        SELECT stack_id, process_id, doc_id, subdoc_idx,
-               image_id, seqno, sst, label_tier, training_label_quality
+    query = sqlalchemy.text(
+        f"""
+        SELECT
+            stack_id,
+            process_id,
+            doc_id,
+            subdoc_idx,
+            image_id,
+            seqno,
+            sst,
+            sfdoc_class,
+            label_tier,
+            training_label_quality
         FROM {schema}.{SOURCE_PAGE_TABLE}
-        WHERE stack_id IS NOT NULL AND image_id IS NOT NULL
-    """)
-    data = pd.read_sql_query(query, engine)
-    data.columns = [str(c).strip().lower() for c in data.columns]
+        WHERE stack_id IS NOT NULL
+          AND image_id IS NOT NULL
+          AND LOWER(stack_id) IN :stack_ids
+        """
+    ).bindparams(sqlalchemy.bindparam("stack_ids", expanding=True))
+    data = pd.read_sql_query(
+        query,
+        engine,
+        params={"stack_ids": sorted(set(stack_ids))},
+    )
+    data.columns = [str(column).strip().lower() for column in data.columns]
     return prepare_page_labels(data)
 
 
 def prepare_page_labels(data: pd.DataFrame) -> pd.DataFrame:
-    """Clean the keys and make image_id and seqno numeric where possible."""
+    """Clean identifiers while preserving their original displayed values."""
+    required = {
+        "stack_id",
+        "process_id",
+        "doc_id",
+        "subdoc_idx",
+        "image_id",
+        "seqno",
+        "sst",
+        "sfdoc_class",
+        "label_tier",
+        "training_label_quality",
+    }
+    missing = required - set(data.columns)
+    if missing:
+        raise ValueError(
+            f"{SOURCE_PAGE_TABLE} is missing columns: {sorted(missing)}"
+        )
+
     data = data.copy()
-    for column in ["stack_id", "process_id", "doc_id", "subdoc_idx"]:
+    for column in ["stack_id", "process_id", "doc_id", "subdoc_idx", "image_id"]:
         data[column] = data[column].map(clean)
 
     data["stack_id_key"] = data["stack_id"].map(stack_key)
     data["doc_id_key"] = data["doc_id"].map(id_key)
     data["subdoc_idx_key"] = data["subdoc_idx"].map(id_key)
     data["sst"] = data["sst"].map(upper_or_none)
-
-    # image_id is VARCHAR by design; keep the original and add a numeric view.
+    data["sfdoc_class"] = data["sfdoc_class"].map(clean)
     data["image_id_num"] = pd.to_numeric(data["image_id"], errors="coerce")
     data["seqno_num"] = pd.to_numeric(data["seqno"], errors="coerce")
     return data.reset_index(drop=True)
 
 
-DOCUMENT_KEYS = ["stack_id_key", "process_id", "doc_id_key", "subdoc_idx_key"]
-
-
 def order_pages(data: pd.DataFrame) -> pd.DataFrame:
-    """Sort pages into document order: seqno first, image_id as fallback."""
+    """Order pages inside each Analyse-DB document by seqno."""
     return data.sort_values(
         DOCUMENT_KEYS + ["seqno_num", "image_id_num", "image_id"],
         na_position="last",
     )
 
 
-def add_page_number(data: pd.DataFrame) -> pd.DataFrame:
-    """Number each document's pages 1..N in document order."""
-    data = order_pages(data).copy()
-    data["page_number"] = data.groupby(DOCUMENT_KEYS, dropna=False).cumcount() + 1
-    data["n_pages"] = data.groupby(DOCUMENT_KEYS, dropna=False)["page_number"].transform("max")
-    return data.reset_index(drop=True)
+def summarize_documents(pages: pd.DataFrame) -> pd.DataFrame:
+    """Create one validation row per final Analyse-DB document."""
+    ordered = order_pages(pages)
+    grouped = ordered.groupby(DOCUMENT_KEYS, dropna=False)
 
-
-def aggregate_documents(pages: pd.DataFrame) -> pd.DataFrame:
-    """Collapse pages to one row per document, keeping the ordered lists."""
-    grouped = pages.groupby(DOCUMENT_KEYS, dropna=False)
     documents = grouped.agg(
         stack_id=("stack_id", "first"),
         doc_id=("doc_id", "first"),
         subdoc_idx=("subdoc_idx", "first"),
-        sst=("sst", "first"),
-        label_tier=("label_tier", "first"),
-        training_label_quality=("training_label_quality", "first"),
-        n_pages=("page_number", "max"),
+        sst=("sst", first_non_null),
+        sfdoc_class=("sfdoc_class", first_non_null),
+        label_tier=("label_tier", first_non_null),
+        training_label_quality=("training_label_quality", first_non_null),
+        n_pages=("image_id", "size"),
+        n_distinct_image_ids=("image_id", "nunique"),
         n_distinct_sst=("sst", "nunique"),
-        image_id_list=("image_id", list),
-        image_id_num_list=("image_id_num", list),
+        n_distinct_sfdoc_class=("sfdoc_class", "nunique"),
+        image_ids=("image_id", join_text),
+        seqnos=("seqno", join_text),
     ).reset_index()
-
-    documents["image_ids"] = documents["image_id_list"].map(
-        lambda values: ",".join(str(v) for v in values)
-    )
-    documents["pages"] = documents["n_pages"].map(
-        lambda n: ",".join(str(i) for i in range(1, int(n) + 1))
-    )
     return documents
 
 
-def build_documents_from_pages(pages: pd.DataFrame) -> pd.DataFrame:
-    """Document rows with ordered image_ids, built from the page table."""
-    return aggregate_documents(add_page_number(pages))
+# ---------------------------------------------------------------------------
+# Mapping validation
+# ---------------------------------------------------------------------------
 
-
-# --- stack-level context ---------------------------------------------------
-
-def add_stack_ssts(documents: pd.DataFrame) -> pd.DataFrame:
-    """Attach the set of SSTs present in each stack."""
-    per_stack = (documents[documents["sst"].notna()]
-                 .groupby("stack_id_key")["sst"]
-                 .apply(lambda values: ", ".join(sorted(set(values))))
-                 .rename("stack_ssts"))
-    return documents.merge(per_stack, on="stack_id_key", how="left")
-
-
-def flatten(lists) -> list:
-    """One flat list from a column of lists."""
-    return [item for sub in lists for item in sub]
-
-
-def is_one_to_n(values: list) -> bool:
-    """True when the values are exactly 1..len(values), each once."""
-    numbers = [v for v in values if pd.notna(v)]
-    return sorted(numbers) == list(range(1, len(numbers) + 1))
-
-
-def add_stack_partition(documents: pd.DataFrame) -> pd.DataFrame:
-    """Check that each stack's image_ids form a complete 1..N partition."""
-    per_stack = (documents.groupby("stack_id_key")["image_id_num_list"]
-                 .apply(flatten))
-    stats = pd.DataFrame({
-        "stack_id_key": per_stack.index,
-        "n_stack_pages": per_stack.map(len).values,
-        "stack_partition_complete": per_stack.map(is_one_to_n).values,
-    })
-    stats["n_documents_in_stack"] = (
-        documents.groupby("stack_id_key").size().reindex(stats["stack_id_key"]).values
+def attach_process_count(documents: pd.DataFrame) -> pd.DataFrame:
+    """Count final process IDs for each mapping-file document key."""
+    counts = (
+        documents.groupby(MAPPING_JOIN_KEYS, dropna=False)["process_id"]
+        .nunique()
+        .rename("n_process_ids_for_key")
+        .reset_index()
     )
-    return documents.merge(stats, on="stack_id_key", how="left")
+    return documents.merge(counts, on=MAPPING_JOIN_KEYS, how="left")
 
 
-# --- document checks -------------------------------------------------------
-
-def max_gap(values: list) -> float:
-    """Largest jump between consecutive image_ids; 1 means contiguous."""
-    numbers = sorted(v for v in values if pd.notna(v))
-    if len(numbers) < 2:
-        return 1
-    return max(b - a for a, b in zip(numbers, numbers[1:]))
-
-
-def add_document_checks(documents: pd.DataFrame) -> pd.DataFrame:
-    """Flag image_id discontinuity per document."""
-    documents = documents.copy()
-    documents["max_image_id_gap"] = documents["image_id_num_list"].map(max_gap)
-    # A large gap means the document's pages sit far apart in the original scan,
-    # which is the shape of an insert that was never split off. OCR triage only.
-    documents["image_ids_contiguous"] = documents["max_image_id_gap"] == 1
-    return documents
+def join_mapping(
+    mapping: pd.DataFrame,
+    documents: pd.DataFrame,
+) -> pd.DataFrame:
+    """Attach Analyse-DB documents only to the delivered MasterIndex sample."""
+    documents = attach_process_count(documents)
+    return mapping.merge(
+        documents,
+        on=MAPPING_JOIN_KEYS,
+        how="left",
+        suffixes=("_mid", ""),
+        validate="one_to_many",
+    )
 
 
-def add_sst_comparison(data: pd.DataFrame) -> pd.DataFrame:
-    """Compare the MasterIndex SST with the Analyse-DB SST; needs the join."""
+def classify_documents(data: pd.DataFrame) -> pd.DataFrame:
+    """Validate the mapping without assuming image_id is a PDF page number."""
     data = data.copy()
     data["sst_matches_mid"] = (
         data["sst"].notna()
         & data["mid_sst"].notna()
-        & (data["sst"] == data["mid_sst"])
+        & data["sst"].eq(data["mid_sst"])
     )
-    return data
-
-
-# --- join and status -------------------------------------------------------
-
-JOIN_KEYS = ["stack_id_key", "doc_id_key", "subdoc_idx_key"]
-
-
-def join_mapping(mapping: pd.DataFrame, documents: pd.DataFrame) -> pd.DataFrame:
-    """Attach the MasterIndex ID to each Analyse-DB document.
-
-    The MasterIndex file has no process_id, so a stack carrying more than one
-    would fan the join out; n_process_ids_for_key records that.
-    """
-    fan_out = (documents.groupby(JOIN_KEYS)["process_id"]
-               .nunique().rename("n_process_ids_for_key").reset_index())
-    documents = documents.merge(fan_out, on=JOIN_KEYS, how="left")
-    return mapping.merge(documents, on=JOIN_KEYS, how="outer",
-                         suffixes=("_mid", ""), indicator="join_side")
-
-
-def rules(data: pd.DataFrame) -> list[tuple[pd.Series, str]]:
-    """Disqualifying conditions, most fundamental first.
-
-    The outer join leaves NaN in the columns from the missing side, so the
-    boolean checks use .ne(True) rather than ~, which cannot invert NaN.
-    """
-    return [
-        (data["join_side"] == "left_only", "NO_ANALYSE_DB_PAGES"),
-        (data["join_side"] == "right_only", "NO_MASTERINDEX_ID"),
-        (data["sst"].isna(), "MISSING_SST"),
-        (data["n_distinct_sst"] > 1, "DOCUMENT_MULTIPLE_SST"),
-        (data["sst_matches_mid"].ne(True), "SST_MISMATCH"),
-        (data["n_process_ids_for_key"] > 1, "AMBIGUOUS_PROCESS_ID"),
-        (data["stack_partition_complete"].ne(True), "STACK_PARTITION_BROKEN"),
-    ]
-
-
-def classify(data: pd.DataFrame) -> pd.DataFrame:
-    """Assign the first failing status so the counts form a partition."""
-    data = data.copy()
     data["mapping_status"] = OK
 
-    for condition, status in rules(data):
-        data.loc[condition.fillna(False) & data["mapping_status"].eq(OK),
-                 "mapping_status"] = status
+    rules = [
+        (data["process_id"].isna(), "NO_ANALYSE_DB_PAGES"),
+        (data["sst"].isna(), "MISSING_SST"),
+        (data["n_distinct_sst"].gt(1), "DOCUMENT_MULTIPLE_SST"),
+        (data["sst_matches_mid"].ne(True), "SST_MISMATCH"),
+        (data["n_process_ids_for_key"].gt(1), "AMBIGUOUS_PROCESS_ID"),
+        (
+            data["n_pages"].ne(data["n_distinct_image_ids"]),
+            "DUPLICATE_IMAGE_ID",
+        ),
+    ]
+    for condition, status in rules:
+        applies = condition.fillna(False) & data["mapping_status"].eq(OK)
+        data.loc[applies, "mapping_status"] = status
 
     data["is_usable"] = data["mapping_status"].eq(OK)
     data["is_training_eligible"] = (
@@ -384,118 +386,125 @@ def classify(data: pd.DataFrame) -> pd.DataFrame:
     return data
 
 
-def build_mapping(mapping: pd.DataFrame, page_labels: pd.DataFrame) -> pd.DataFrame:
-    """Full document table: MasterIndex ID, ordered pages, checks, status."""
-    documents = build_documents_from_pages(page_labels)
-    documents = add_document_checks(add_stack_partition(add_stack_ssts(documents)))
-    return classify(add_sst_comparison(join_mapping(mapping, documents)))
+# ---------------------------------------------------------------------------
+# Page-level output and TB0 label
+# ---------------------------------------------------------------------------
+
+def make_page_class(data: pd.DataFrame) -> pd.DataFrame:
+    """Use sfdoc_class for TB0; retain the final SST for every other page."""
+    data = data.copy()
+    is_technikblatt = (
+        data["sfdoc_class"]
+        .fillna("")
+        .str.contains("Technikblatt", case=False, regex=False)
+    )
+    data["page_class"] = data["sst"]
+    data["page_class_source"] = "SST"
+    data.loc[is_technikblatt, "page_class"] = TB0
+    data.loc[is_technikblatt, "page_class_source"] = "SFDOC_CLASS"
+    return data
 
 
-# --- page grain ------------------------------------------------------------
-
-PAGE_CARRY = [
-    "masterindex_id", "stack_id", "process_id", "doc_id", "subdoc_idx",
-    "sst", "training_label_quality", "n_pages", "image_ids_contiguous",
-]
-
-
-def explode_pages(documents: pd.DataFrame) -> pd.DataFrame:
-    """One row per page of every usable document."""
+def build_pages(
+    page_labels: pd.DataFrame,
+    documents: pd.DataFrame,
+) -> pd.DataFrame:
+    """Return exact Analyse-DB page rows for usable sampled documents."""
     usable = documents[documents["is_usable"]].copy()
     if usable.empty:
-        return pd.DataFrame(columns=PAGE_CARRY + ["page_number", "image_id"])
+        return pd.DataFrame()
 
-    usable["page_pairs"] = usable["image_id_list"].map(
-        lambda values: list(enumerate(values, start=1))
+    carry = DOCUMENT_KEYS + [
+        "masterindex_id",
+        "mid_sst",
+        "mapping_status",
+        "is_usable",
+        "is_training_eligible",
+    ]
+    usable = usable[carry].drop_duplicates(DOCUMENT_KEYS)
+    pages = page_labels.merge(
+        usable,
+        on=DOCUMENT_KEYS,
+        how="inner",
+        validate="many_to_one",
     )
-    pages = usable[PAGE_CARRY + ["page_pairs"]].explode("page_pairs")
-    pages["page_number"] = pages["page_pairs"].map(lambda pair: pair[0])
-    pages["image_id"] = pages["page_pairs"].map(lambda pair: pair[1])
-    return pages.drop(columns=["page_pairs"]).reset_index(drop=True)
+    pages = order_pages(pages).copy()
+    pages["page_number"] = (
+        pages.groupby(DOCUMENT_KEYS, dropna=False).cumcount() + 1
+    )
+    pages["n_pages"] = pages.groupby(DOCUMENT_KEYS, dropna=False)[
+        "image_id"
+    ].transform("size")
+    pages["is_first_page"] = pages["page_number"].eq(1)
+    pages["is_last_page"] = pages["page_number"].eq(pages["n_pages"])
+    return make_page_class(pages).reset_index(drop=True)
 
 
-def add_page_boundaries(pages: pd.DataFrame) -> pd.DataFrame:
-    """Mark the first and last page of each document."""
-    pages = pages.copy()
-    pages["is_first_page"] = pages["page_number"] == 1
-    pages["is_last_page"] = pages["page_number"] == pages["n_pages"]
-    return pages
-
-
-def add_pdf_page_number(pages: pd.DataFrame) -> pd.DataFrame:
-    """Position of each page inside its MasterIndex PDF.
-
-    page_number restarts at 1 per document, so when one MID covers several
-    documents they have to be laid end to end. Document order is assumed to
-    follow the first page's position, which is UNVERIFIED — check a
-    multi-document MID against its PDF before relying on pdf_page_number.
-    """
-    pages = pages.sort_values(["masterindex_id", "doc_id", "page_number"]).copy()
-    pages["pdf_page_number"] = pages.groupby("masterindex_id").cumcount() + 1
-    n_docs = (pages.groupby("masterindex_id")["doc_id"]
-              .nunique().rename("n_documents_in_mid"))
-    return pages.merge(n_docs, on="masterindex_id", how="left").reset_index(drop=True)
-
-
-def build_pages(documents: pd.DataFrame) -> pd.DataFrame:
-    """Page-level table for usable documents."""
-    return add_pdf_page_number(add_page_boundaries(explode_pages(documents)))
-
-
-# --- output ----------------------------------------------------------------
-
-def status_summary(data: pd.DataFrame) -> pd.DataFrame:
-    """Documents, MIDs, stacks and pages per status."""
-    return (data.groupby("mapping_status", dropna=False)
-            .agg(n_documents=("mapping_status", "size"),
-                 n_masterindex_ids=("masterindex_id", "nunique"),
-                 n_stacks=("stack_id_key", "nunique"),
-                 n_pages=("n_pages", "sum"))
-            .reset_index().sort_values("n_documents", ascending=False))
-
-
-def report(documents: pd.DataFrame, pages: pd.DataFrame) -> None:
-    """Print the status breakdown and the OCR triage counts."""
-    print("\nStatus:")
-    print(status_summary(documents).to_string(index=False))
-
-    usable = documents[documents["is_usable"]]
-    if usable.empty:
-        print("\nNo usable documents.")
-        return
-
-    n_split = int(usable["image_ids_contiguous"].ne(True).sum())
-    print(f"\nUsable documents: {len(usable):,}  pages: {len(pages):,}")
-    print(f"Non-contiguous image_ids: {n_split:,} ({n_split / len(usable):.2%}) "
-          "— candidates for OCR review.")
-
-    print("\nDocuments per stack:")
-    print(usable.drop_duplicates("stack_id_key")["n_documents_in_stack"]
-          .value_counts().sort_index().to_string())
-
-    per_mid = pages.drop_duplicates("masterindex_id")["n_documents_in_mid"]
-    n_multi = int((per_mid > 1).sum())
-    print("\nDocuments per MasterIndex ID:")
-    print(per_mid.value_counts().sort_index().to_string())
-    if n_multi:
-        print(f"{n_multi:,} MIDs ({n_multi / len(per_mid):.2%}) hold several "
-              "documents; pdf_page_number assumes they are laid end to end. "
-              "Verify one against its PDF.")
-
+# ---------------------------------------------------------------------------
+# Output
+# ---------------------------------------------------------------------------
 
 DOCUMENT_COLUMNS = [
-    "masterindex_id", "stack_id", "process_id", "doc_id", "subdoc_idx",
-    "stack_ssts", "sst", "mid_sst", "sst_matches_mid",
-    "label_tier", "training_label_quality",
-    "n_pages", "image_ids", "pages",
-    "image_ids_contiguous", "max_image_id_gap",
-    "n_documents_in_stack", "stack_partition_complete",
-    "mapping_status", "is_usable", "is_training_eligible",
+    "masterindex_id",
+    "stack_id",
+    "process_id",
+    "doc_id",
+    "subdoc_idx",
+    "sst",
+    "mid_sst",
+    "sst_matches_mid",
+    "sfdoc_class",
+    "label_tier",
+    "training_label_quality",
+    "n_pages",
+    "image_ids",
+    "seqnos",
+    "n_process_ids_for_key",
+    "mapping_status",
+    "is_usable",
+    "is_training_eligible",
 ]
+
+PAGE_COLUMNS = [
+    "masterindex_id",
+    "stack_id",
+    "process_id",
+    "doc_id",
+    "subdoc_idx",
+    "image_id",
+    "seqno",
+    "page_number",
+    "n_pages",
+    "sst",
+    "mid_sst",
+    "sfdoc_class",
+    "page_class",
+    "page_class_source",
+    "label_tier",
+    "training_label_quality",
+    "is_first_page",
+    "is_last_page",
+    "mapping_status",
+    "is_usable",
+    "is_training_eligible",
+]
+
+
+def status_summary(documents: pd.DataFrame) -> pd.DataFrame:
+    return (
+        documents.groupby("mapping_status", dropna=False)
+        .agg(
+            n_documents=("mapping_status", "size"),
+            n_masterindex_ids=("masterindex_id", "nunique"),
+            n_stacks=("stack_id_key", "nunique"),
+            n_pages=("n_pages", "sum"),
+        )
+        .reset_index()
+        .sort_values("n_documents", ascending=False)
+    )
 
 
 def write_frame(data: pd.DataFrame, csv_path: Path, parquet_path: Path) -> None:
-    """Write one frame as CSV, and as Parquet when the engine is available."""
     data.to_csv(csv_path, index=False, encoding="utf-8-sig")
     try:
         data.to_parquet(parquet_path, index=False)
@@ -504,18 +513,48 @@ def write_frame(data: pd.DataFrame, csv_path: Path, parquet_path: Path) -> None:
 
 
 def write_outputs(documents: pd.DataFrame, pages: pd.DataFrame) -> None:
-    """Write the document table, the page table, and the status summary."""
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    columns = [c for c in DOCUMENT_COLUMNS if c in documents.columns]
-    write_frame(documents[columns], DOCUMENTS_CSV, DOCUMENTS_PARQUET)
-    write_frame(pages, PAGES_CSV, PAGES_PARQUET)
-    status_summary(documents).to_csv(SUMMARY_CSV, index=False, encoding="utf-8-sig")
+    document_columns = [column for column in DOCUMENT_COLUMNS if column in documents]
+    page_columns = [column for column in PAGE_COLUMNS if column in pages]
+    write_frame(
+        documents[document_columns],
+        DOCUMENTS_CSV,
+        DOCUMENTS_PARQUET,
+    )
+    write_frame(pages[page_columns], PAGES_CSV, PAGES_PARQUET)
+    status_summary(documents).to_csv(
+        SUMMARY_CSV,
+        index=False,
+        encoding="utf-8-sig",
+    )
 
 
-# --- Snowflake -------------------------------------------------------------
+def print_report(documents: pd.DataFrame, pages: pd.DataFrame) -> None:
+    print("\nMapping status:")
+    print(status_summary(documents).to_string(index=False))
+
+    print(f"\nSample documents: {len(documents):,}")
+    print(f"Usable documents: {int(documents['is_usable'].sum()):,}")
+    print(f"Output pages: {len(pages):,}")
+
+    if pages.empty:
+        print("No usable page rows were produced.")
+        return
+
+    print("\nFinal page classes:")
+    print(pages["page_class"].value_counts(dropna=False).to_string())
+    print(f"\nTB0 pages from sfdoc_class: {int(pages['page_class'].eq(TB0).sum()):,}")
+    print(
+        "TB0 documents: "
+        f"{pages.loc[pages['page_class'].eq(TB0), DOCUMENT_KEYS].drop_duplicates().shape[0]:,}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Optional publication
+# ---------------------------------------------------------------------------
 
 def load_existing_documents() -> pd.DataFrame:
-    """Read the document table that was already built."""
     if not DOCUMENTS_CSV.is_file():
         raise FileNotFoundError(f"Not found: {DOCUMENTS_CSV}\nBuild the mapping first.")
     data = pd.read_csv(DOCUMENTS_CSV, dtype=str, low_memory=False)
@@ -523,74 +562,67 @@ def load_existing_documents() -> pd.DataFrame:
     return data
 
 
-def publish_to_snowflake(documents: pd.DataFrame, engine: sqlalchemy.Engine,
-                         schema: str) -> None:
-    """Replace <schema>.PROC_LIFE_MID_ADB with the usable documents."""
+def publish_to_snowflake(
+    documents: pd.DataFrame,
+    engine: sqlalchemy.Engine,
+    schema: str,
+) -> None:
     from snowflake.connector.pandas_tools import pd_writer
 
-    usable = documents[documents["is_usable"]]
+    usable = documents[documents["is_usable"]].copy()
     if usable.empty:
         raise RuntimeError("No usable documents to publish.")
 
-    usable = usable[[c for c in DOCUMENT_COLUMNS if c in usable.columns]].copy()
-    usable.columns = [c.upper() for c in usable.columns]
-    usable.to_sql(SNOWFLAKE_OUTPUT_TABLE, con=engine, schema=schema,
-                  if_exists="replace", index=False, method=pd_writer)
-
-    with engine.connect() as connection:
-        published = connection.execute(sqlalchemy.text(
-            f"SELECT COUNT(*) FROM {schema}.{SNOWFLAKE_OUTPUT_TABLE}"
-        )).scalar_one()
-
-    if int(published) != len(usable):
-        raise RuntimeError(
-            f"Row-count mismatch: local {len(usable):,}, published {int(published):,}."
-        )
-    print(f"Published {len(usable):,} rows to {schema}.{SNOWFLAKE_OUTPUT_TABLE}.")
-
-
-# --- entry point -----------------------------------------------------------
-
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Join the MasterIndex file to Analyse-DB page labels."
+    usable.columns = [column.upper() for column in usable.columns]
+    usable.to_sql(
+        SNOWFLAKE_OUTPUT_TABLE,
+        con=engine,
+        schema=schema,
+        if_exists="replace",
+        index=False,
+        method=pd_writer,
     )
-    parser.add_argument("--schema", default=DEFAULT_SCHEMA)
-    parser.add_argument("--mapping-file", type=Path, default=MAPPING_FILE)
-    parser.add_argument("--publish-snowflake", action="store_true")
-    parser.add_argument("--yes", action="store_true", help="Skip the publish prompt.")
-    return parser.parse_args()
+    print(
+        f"Published {len(usable):,} rows to "
+        f"{schema}.{SNOWFLAKE_OUTPUT_TABLE}."
+    )
 
 
 def confirm_publish(schema: str) -> bool:
-    """Ask before replacing the Snowflake table."""
     answer = input(f"Replace {schema}.{SNOWFLAKE_OUTPUT_TABLE}? (y/n): ")
     return answer.strip().lower() == "y"
 
 
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--schema", default=DEFAULT_SCHEMA)
+    parser.add_argument("--mapping-file", type=Path, default=MAPPING_FILE)
+    parser.add_argument("--publish-snowflake", action="store_true")
+    parser.add_argument("--yes", action="store_true")
+    return parser.parse_args()
+
+
 def build(args: argparse.Namespace, engine: sqlalchemy.Engine, schema: str) -> None:
-    """Build both tables and write them."""
     mapping = load_mapping(args.mapping_file)
-    print(f"MasterIndex rows: {len(mapping):,}")
+    print(f"MasterIndex sample rows: {len(mapping):,}")
 
-    page_labels = load_page_labels(engine, schema)
-    print(f"Analyse-DB pages: {len(page_labels):,}")
+    selected_stack_ids = mapping["stack_id_key"].dropna().unique().tolist()
+    page_labels = load_page_labels(engine, schema, selected_stack_ids)
+    print(f"Final Analyse-DB page rows: {len(page_labels):,}")
 
-    documents = build_mapping(mapping, page_labels)
-    pages = build_pages(documents)
+    adb_documents = summarize_documents(page_labels)
+    documents = classify_documents(join_mapping(mapping, adb_documents))
+    pages = build_pages(page_labels, documents)
 
-    report(documents, pages)
     write_outputs(documents, pages)
+    print_report(documents, pages)
     print(f"\nDocuments: {DOCUMENTS_CSV}")
     print(f"Pages:     {PAGES_CSV}")
     print(f"Summary:   {SUMMARY_CSV}")
-
-
-def publish(args: argparse.Namespace, engine: sqlalchemy.Engine, schema: str) -> None:
-    """Publish the document table that was already built."""
-    documents = load_existing_documents()
-    if args.yes or confirm_publish(schema):
-        publish_to_snowflake(documents, engine, schema)
 
 
 def main() -> int:
@@ -599,7 +631,9 @@ def main() -> int:
     engine = get_engine(schema=schema)
 
     if args.publish_snowflake:
-        publish(args, engine, schema)
+        documents = load_existing_documents()
+        if args.yes or confirm_publish(schema):
+            publish_to_snowflake(documents, engine, schema)
     else:
         build(args, engine, schema)
     return 0
