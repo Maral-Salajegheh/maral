@@ -189,8 +189,8 @@ def main():
     signature = fingerprint()
     cache = config.CACHE_DIR / ("securegpt_only_" + signature)
     # Results contain only the selected input pages, with separate full/limited runs.
-    selection = hashlib.sha256(json.dumps(pages, sort_keys=True).encode()).hexdigest()[:12]
-    output = config.OUTPUT_DIR / ("securegpt_only_" + signature + "_" + selection)
+    run_id = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    output = config.OUTPUT_DIR / run_id
     cache.mkdir(parents=True, exist_ok=True)
     output.mkdir(parents=True, exist_ok=True)
     with (cache / ".run.lock").open("w") as lock:

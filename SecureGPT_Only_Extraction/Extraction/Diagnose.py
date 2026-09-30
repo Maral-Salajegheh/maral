@@ -12,7 +12,7 @@ def main():
     args = parser.parse_args()
     path = args.run
     if path is None:
-        runs = [p for p in config.OUTPUT_DIR.glob("securegpt_only_*") if (p / "summary.json").is_file()]
+        runs = [p for p in config.OUTPUT_DIR.glob("*") if (p / "summary.json").is_file()]
         if not runs:
             parser.error("No completed or interrupted SecureGPT-only output found")
         path = max(runs, key=lambda p: (p / "summary.json").stat().st_mtime)
