@@ -20,7 +20,10 @@ def normalise_number(value):
 
 def page_scope(page):
     meta = page["metadata"]
-    return str(meta.get("masterindex_id") or ""), str(meta.get("pdf_path_in_zip") or "")
+    return (
+        str(meta.get("masterindex_id") or "").strip(),
+        str(meta.get("pdf_path_in_zip") or ""),
+    )
 
 
 def comparable(name, value):
