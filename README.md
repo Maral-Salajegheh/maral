@@ -22,16 +22,3 @@ Extraction/README.md
 
 
 
-cat >> .gitignore <<'EOF'
-
-# Python cache
-__pycache__/
-*.pyc
-
-# Extraction local/test files
-Extraction/test/
-Extraction/test_pipeline.py
-Extraction/Input/
-Extraction/test_page.png
-Extraction/tocke_test.py
-EOF
