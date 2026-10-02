@@ -22,3 +22,11 @@ Extraction/README.md
 
 
 
+cd /home/I060689/Projects/life-docai/Antrag/Classification
+
+grep -n "import_assign_splits" pnc_data.py
+grep -n "IGNORE_INDEX" config.py pnc_stage2.py
+grep -n "return cache, enriched, features" pnc_stage2.py
+grep -n "validation_report_write_text" data.py
+grep -n '"--seed"' pnc_inputs.py
+ls model.py models.py training.py 2>/dev/null
