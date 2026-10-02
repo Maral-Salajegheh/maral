@@ -5,4 +5,4 @@ rg -n -A 25 -B 5 'ocr_cache' Antrag/Classification/ocr.py Antrag/Classification/
 rg -n -C 3 'ocr_cache|build_ocr_cache' Antrag/Classification/pnc_inputs.py
 
 
-rg -n -C 3 'ocr_cache|build_ocr_cache' Antrag/Classification/pnc_inputs.py
+ocr = load_ocr_cache(config.pnc_ocr_cache) if modality in {"text", "fusion"} else {}
