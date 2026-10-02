@@ -19,3 +19,19 @@ Extraction/pages.py \
 Extraction/response_model.py \
 Extraction/securegpt_client.py \
 Extraction/README.md
+
+
+
+cat >> .gitignore <<'EOF'
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Extraction local/test files
+Extraction/test/
+Extraction/test_pipeline.py
+Extraction/Input/
+Extraction/test_page.png
+Extraction/tocke_test.py
+EOF
