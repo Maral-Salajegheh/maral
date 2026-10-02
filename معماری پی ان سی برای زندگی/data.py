@@ -17,7 +17,6 @@ REQUIRED_PAGE_COLUMNS = {
     "training_label_quality", "is_first_page", "is_last_page", "mapping_status",
     "is_usable", "is_training_eligible",
 }
-
 PAGE_FIELDS = [
     "masterindex_id", "stack_id", "process_id", "doc_id", "subdoc_idx",
     "image_id", "seqno", "page_number", "pdf_page_number", "image_path",
@@ -25,7 +24,6 @@ PAGE_FIELDS = [
     "sst", "sfdoc_class", "page_class", "page_class_source", "is_first_page",
     "is_last_page",
 ]
-
 VERIFY_FIELDS = [
     "masterindex_id", "doc_id", "image_id", "seqno", "pdf_page_number",
     "sfdoc_class", "page_class", "image_path", "image_sha256",
@@ -61,7 +59,7 @@ def load_mapped_pages(config: PipelineConfig):
         raise ValueError(f"Missing columns: {sorted(missing)}")
     for row in rows:
         if row["is_usable"].lower() != "true":
-            raise ValueError("Life_mid_pages.csv contains an unusable row")
+            raise ValueError("life_mid_pages.csv contains an unusable row")
         if row["page_class"] not in CLASSES:
             raise ValueError(f"Unexpected class: {row['page_class']}")
         if row["page_class"] == "TB0" and row["sst"] != "A00":
@@ -117,7 +115,7 @@ def build_report(pages, matched, skipped, inventory):
             for status in sorted(by_status)
         },
         "quality_status": dict(Counter(str(row.get("quality_status") or "UNSET") for row in inventory)),
-        "duplicate_image_paths": {path for path, count in Counter(row["image_path"] for row in matched).items() if count > 1},
+        "duplicate_image_paths": [path for path, count in Counter(row["image_path"] for row in matched).items() if count > 1],
         "duplicate_image_sha256_row_count": sum(count for count in image_sha_counts.values() if count > 1),
         "label_tier_matched": dict(Counter(row["training_label_quality"] for row in matched)),
         "sst_page_class": {f"{sst} x {label}": count for (sst, label), count in Counter((row["sst"], row["page_class"]) for row in pages).items()},
@@ -129,14 +127,14 @@ def write_verification_sheet(config: PipelineConfig, rows):
     for row in rows:
         if row["page_class"] == "TB0" and row["masterindex_id"] not in selected_mids:
             selected.append(row); selected_mids.add(row["masterindex_id"]); tb0_mids.add(row["masterindex_id"])
-            if len(tb0_mids) >= 5:
-                break
+        if len(tb0_mids) >= 5:
+            break
     for label in CLASSES:
         for row in rows:
             if row["page_class"] == label and row["masterindex_id"] not in selected_mids:
                 selected.append(row); selected_mids.add(row["masterindex_id"])
-                if len(selected_mids) >= 20:
-                    break
+            if len(selected_mids) >= 20:
+                break
         if len(selected_mids) >= 20:
             break
     if len(selected_mids) < 20 or len(tb0_mids) < 5:
@@ -149,7 +147,7 @@ def prepare_verified_data(config: PipelineConfig):
     pages = load_mapped_pages(config)
     matched, skipped, inventory = resolve_image_rows(config, pages)
     report = build_report(pages, matched, skipped, inventory)
-    config.validation_report_write_text(json.dumps(report, indent=2, sort_keys=True), encoding="utf-8")
+    config.validation_report.write_text(json.dumps(report, indent=2, sort_keys=True), encoding="utf-8")
     write_csv(config.matched_pages_csv, matched, PAGE_FIELDS + ["match_status"])
     write_csv(config.skipped_pages_csv, skipped, PAGE_FIELDS + ["match_status", "rendered_page_count"])
     write_verification_sheet(config, matched)

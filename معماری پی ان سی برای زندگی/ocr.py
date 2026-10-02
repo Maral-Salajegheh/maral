@@ -46,6 +46,7 @@ def load_ocr_cache(path):
 def selected_engine_name():
     try:
         import rapidocr_onnxruntime  # noqa: F401
+
         return "rapidocr-onnxruntime"
     except BaseException:
         return "paddleocr"
@@ -66,7 +67,7 @@ def build_ocr_engine():
             "paddleocr",
             PaddleOCR(
                 lang="de",
-                ocr_version="PP-OCRv4",
+                ocr_version="PP-OCRv6",
                 use_doc_orientation_classify=True,
                 use_doc_unwarping=True,
             ),
@@ -119,7 +120,7 @@ def _ensure_consistent_cache(config, engine_name):
     cache, engines, malformed = _read_cache(config.ocr_cache)
     if malformed or len(engines) > 1 or (engines and engines != {engine_name}):
         print(
-            f"Clearing inconsistent OCR cache: "
+            "Clearing inconsistent OCR cache: "
             f"engines={sorted(engines)}, malformed={malformed}, selected={engine_name}"
         )
         config.ocr_cache.unlink(missing_ok=True)

@@ -177,7 +177,7 @@ def run_epoch(model, loader, optimizer, device, use_fp16=False, use_bf16=False):
         class_true.extend(class_target.cpu().tolist()); class_pred.extend(pred_class.argmax(-1).cpu().tolist())
         first_true.extend(first_target.cpu().tolist()); first_pred.extend(pred_first.argmax(-1).cpu().tolist())
         last_true.extend(last_target.cpu().tolist()); last_pred.extend(pred_last.argmax(-1).cpu().tolist())
-        qualities.extend([row["training_label_quality"] for row in rows])
+        qualities.extend(row["training_label_quality"] for row in rows)
     result = classification_metrics(class_true, class_pred)
     result["loss"] = total_loss / max(len(class_true), 1)
     result["first_page"] = binary_metrics(first_true, first_pred)
@@ -258,7 +258,7 @@ def train(args):
         if balance_report["supervised_pages_per_class"].get(label, 0) < 500 or balance_report["mids_containing_class"].get(label, 0) < 50
     }
     print(json.dumps({"balance_report": balance_report, "low_support_classes": low_support}, indent=2))
-    run_name = args.run_name or datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+    run_name = args.run_name or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     for epoch in range(start_epoch, args.epochs):
         train_metrics = run_epoch(model, train_loader, optimizer, device, args.use_fp16, args.use_bf16)
         val_metrics = run_epoch(model, val_loader, None, device, args.use_fp16, args.use_bf16)

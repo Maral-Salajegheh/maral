@@ -37,6 +37,7 @@ def extract_features(config, checkpoint, output, batch_size=8, limit_mids=None, 
         parameter.requires_grad_(False)
     model.eval()
     modality = metadata["modality"]
+    ##ocr = load_ocr_cache(config.ocr_cache) if modality in {"text", "fusion"} else {}
     ocr = load_ocr_cache(config.pnc_ocr_cache) if modality in {"text", "fusion"} else {}
     clip = load_clip(config) if modality in {"vision", "fusion"} else {}
     dataset = Stage1Dataset(selected, model, modality, ocr, clip)
@@ -76,14 +77,13 @@ def extract_features(config, checkpoint, output, batch_size=8, limit_mids=None, 
                     "training_label_quality": row["training_label_quality"],
                     "placement": row["placement"],
                 })
-
     feature_tensor = torch.cat(feature_blocks) if feature_blocks else torch.zeros((0, 2048 if modality == "fusion" else 1024))
     expected_dim = 2048 if modality == "fusion" else 1024
     if feature_tensor.shape != (len(page_metadata), expected_dim):
-        raise ValueError(f"Feature shape mismatch: {feature_tensor.shape}, expected ({len(page_metadata)}, {expected_dim})")
+        raise ValueError(f"Feature shape mismatch: {feature_tensor.shape}, expected {(len(page_metadata), expected_dim)}")
     cache = {
         "metadata": {
-            "format": "PNC_trained_stage1_features_v2",
+            "format": "PnC_trained_stage1_features_v2",
             "stage1_checkpoint": str(Path(checkpoint).resolve()),
             "stage1_checkpoint_sha256": file_sha256(checkpoint),
             "modality": modality,

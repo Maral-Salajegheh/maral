@@ -13,22 +13,18 @@ from tqdm import tqdm
 from .config import CLIP_MODEL_NAME, CLIP_MODEL_PATH, PipelineConfig
 from .data import read_csv
 
-
 class ImagePathDataset(Dataset):
     def __init__(self, rows, root, transform):
         self.rows = rows
         self.root = root
         self.transform = transform
-
     def __len__(self):
         return len(self.rows)
-
     def __getitem__(self, idx):
         row = self.rows[idx]
         path = self.root / row["image_path"]
         image = Image.open(path).convert("RGB")
         return idx, self.transform(image)
-
 
 def _save_features_atomic(config, features):
     tmp_path = config.clip_feature_file.with_suffix(".pt.tmp")
@@ -65,7 +61,6 @@ def precompute_clip(config, limit=None, batch_size=32, device=None, checkpoint_e
     _save_features_atomic(config, features)
     print(f"clip_features={config.clip_feature_file} rows={len(features)}")
 
-
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--batch-id", default=PipelineConfig.batch_id)
@@ -74,7 +69,6 @@ def main():
     parser.add_argument("--device")
     args = parser.parse_args()
     precompute_clip(PipelineConfig(batch_id=args.batch_id), args.limit, args.batch_size, args.device)
-
 
 if __name__ == "__main__":
     main()

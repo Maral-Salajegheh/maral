@@ -13,7 +13,6 @@ TEXT_MODEL_NAME = os.getenv("BERT_MODEL_PATH", str(ROOT_MODELS_DIR / "gbert-larg
 CLIP_MODEL_NAME = "ViT-H-14"
 CLIP_MODEL_PATH = os.getenv("CLIP_MODEL_PATH", str(ROOT_MODELS_DIR / "CLIP-ViT-H-14-laion2B-s32B-b79K/open_clip_pytorch_model.safetensors"))
 
-
 @dataclass(frozen=True)
 class PipelineConfig:
     batch_id: str = "life_20260918_A00_G07_MAD_6000_sample_MID"
@@ -86,6 +85,7 @@ class PipelineConfig:
     @property
     def checkpoints_dir(self) -> Path:
         return self.classification_output / "checkpoints"
+
 
     @property
     def pnc_ocr_cache(self) -> Path:

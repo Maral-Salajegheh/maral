@@ -9,30 +9,15 @@ from pathlib import Path
 import pyarrow.parquet as pq
 
 from .config import CLASSES, CLASS_TO_ID, PipelineConfig
-from .data import import_assign_splits, read_csv, write_csv
+from .data import assign_splits, read_csv, write_csv
 
 IGNORE_INDEX = -100
 MODEL_FIELDS = [
-    "page_identity",
-    "masterindex_id",
-    "stack_id",
-    "pdf_page_number",
-    "image_path",
-    "image_sha256",
-    "has_label",
-    "page_class",
-    "class_target",
-    "is_first_page",
-    "segmentation_target",
-    "is_last_page",
-    "last_page_target",
-    "doc_id",
-    "image_id",
-    "seqno",
-    "sfdoc_class",
-    "label_tier",
-    "training_label_quality",
-    "placement",
+    "page_identity", "masterindex_id", "stack_id", "pdf_page_number",
+    "image_path", "image_sha256", "has_label", "page_class", "class_target",
+    "is_first_page", "segmentation_target", "is_last_page", "last_page_target",
+    "doc_id", "image_id", "seqno", "sfdoc_class", "label_tier",
+    "training_label_quality", "placement",
 ]
 
 
@@ -44,7 +29,7 @@ def population_hash(rows):
     digest = hashlib.sha256()
     for row in sorted(rows, key=lambda item: (item["masterindex_id"], int(item["pdf_page_number"]))):
         digest.update(
-            f"{row['page_identity']}{row['masterindex_id']}{row['stack_id']}{row['pdf_page_number']}{row['has_label']}\n".encode()
+            f'{row["page_identity"]}|{row["masterindex_id"]}|{row["stack_id"]}|{row["pdf_page_number"]}|{row["has_label"]}\n'.encode()
         )
     return digest.hexdigest()
 
@@ -116,20 +101,16 @@ def build_model_population(config: PipelineConfig):
         if any(len(rows) != 1 for rows in images_by_page.values()):
             invalid.append({"masterindex_id": mid, "reason": "duplicate_rendered_position"})
             continue
-
         label_positions = set(labels_by_page)
         image_positions = set(images_by_page)
         try:
             extras = validate_position_sets(label_positions, image_positions)
         except ValueError as error:
             reason, _, positions = str(error).partition(":")
-            if reason == "label_without_image":
-                rendered_mid_missing_label_image += len(label_positions - image_positions)
-            if reason == "ambiguous_unmatched_rendered":
-                ambiguous_unmatched += len(image_positions - label_positions)
+            if reason == "label_without_image": rendered_mid_missing_label_image += len(label_positions - image_positions)
+            if reason == "ambiguous_unmatched_rendered": ambiguous_unmatched += len(image_positions - label_positions)
             invalid.append({"masterindex_id": mid, "reason": reason, "positions": positions})
             continue
-
         if not extras:
             fully_matched_mids += 1
         unmatched_rendered += len(extras)
@@ -223,7 +204,8 @@ def prepare_model_population(config: PipelineConfig):
     if invalid:
         if not config.invalid_mids_report.exists():
             config.invalid_mids_report.write_text(json.dumps(invalid, indent=2), encoding="utf-8")
-            raise RuntimeError(f"Unresolved invalid MIDs: {len(invalid)}; see {config.invalid_mids_report}")
+        raise RuntimeError(f"Unresolved invalid MIDs; {len(invalid)}; see {config.invalid_mids_report}")
+    _write_new(config.model_pages_csv, rows, MODEL_FIELDS)
     if config.population_report.exists():
         raise FileExistsError(f"Refusing to overwrite existing file: {config.population_report}")
     config.population_report.write_text(json.dumps(report, indent=2, sort_keys=True), encoding="utf-8")
