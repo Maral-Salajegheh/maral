@@ -1,11 +1,17 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-"""Map the delivered MasterIndex sample to final Analyse-DB page labels.
+"""Map the delivered MasterIndex file to final Analyse-DB page labels.
 
-TB0 is not detected with OCR.  The final page table already carries the
-verified document class in sfdoc_class.  A page is labelled TB0 when its
+TB0 is not detected with OCR. The final page table already carries the
+verified document class in sfdoc_class. A page is labelled TB0 when its
 sfdoc_class contains "Technikblatt"; otherwise its existing SST is retained.
+
+The PDF page of each row inside its stack PDF is computed with the rule
+verified on real documents: a document starts right after all pages of the
+documents delivered before it in the stack, and seqno gives the position
+inside the document. Documents are ordered by where their first row appears in
+the Snowflake result, so the rule runs before any sorting.
 
 Run from life-docai/Antrag/Datasets/Mapping:
 
@@ -182,7 +188,7 @@ def detect_text_format(path: Path) -> tuple[str, str]:
 
 
 def load_mapping(path: Path) -> pd.DataFrame:
-    """Load the delivered sample and create normalized join keys."""
+    """Load the delivered MasterIndex file and create normalized join keys."""
     if not path.is_file():
         raise FileNotFoundError(f"MasterIndex mapping file not found: {path}")
 
@@ -226,7 +232,11 @@ def load_page_labels(
     schema: str,
     stack_ids: list[str],
 ) -> pd.DataFrame:
-    """Read final page rows only for stacks present in the input sample."""
+    """Read final page rows only for stacks present in the input file.
+
+    delivery_row records the order in which Snowflake returned the rows. The
+    PDF-page rule depends on that order, so it is captured before any sort.
+    """
     if not stack_ids:
         raise ValueError("The MasterIndex mapping contains no usable stack_id.")
 
@@ -255,6 +265,7 @@ def load_page_labels(
         params={"stack_ids": sorted(set(stack_ids))},
     )
     data.columns = [str(column).strip().lower() for column in data.columns]
+    data["delivery_row"] = range(len(data))
     return prepare_page_labels(data)
 
 
@@ -271,6 +282,7 @@ def prepare_page_labels(data: pd.DataFrame) -> pd.DataFrame:
         "sfdoc_class",
         "label_tier",
         "training_label_quality",
+        "delivery_row",
     }
     missing = required - set(data.columns)
     if missing:
@@ -291,6 +303,48 @@ def prepare_page_labels(data: pd.DataFrame) -> pd.DataFrame:
     data["seqno_num"] = pd.to_numeric(data["seqno"], errors="coerce")
     return data.reset_index(drop=True)
 
+
+# ---------------------------------------------------------------------------
+# PDF page inside the stack PDF
+# ---------------------------------------------------------------------------
+
+def document_offsets(pages: pd.DataFrame) -> pd.DataFrame:
+    """Pages before each document inside its own MasterIndex PDF.
+
+    Documents are ordered by where their first row appears in the delivery.
+    A new masterindex_id is a new PDF, so the count restarts there.
+    """
+    keys = DOCUMENT_KEYS + ["masterindex_id"]
+    documents = (
+        pages.groupby(keys, dropna=False)
+        .agg(first_row=("delivery_row", "min"), n_doc_pages=("image_id", "size"))
+        .reset_index()
+        .sort_values(["masterindex_id", "first_row"])
+    )
+    documents["pages_before"] = (
+        documents.groupby("masterindex_id")["n_doc_pages"].cumsum()
+        - documents["n_doc_pages"]
+    )
+    return documents[keys + ["pages_before"]]
+
+
+def add_pdf_page_number(pages: pd.DataFrame) -> pd.DataFrame:
+    """Page position inside the row's own MasterIndex PDF."""
+    keys = DOCUMENT_KEYS + ["masterindex_id"]
+    pages = pages.merge(document_offsets(pages), on=keys, how="left")
+    pages["pdf_page_number"] = (
+        pages["pages_before"] + pages["seqno_num"]
+    ).astype("Int64")
+    pages["pdf_page_number_duplicate"] = pages.duplicated(
+        ["masterindex_id", "pdf_page_number"],
+        keep=False,
+    )
+    return pages.drop(columns=["pages_before"]).reset_index(drop=True)
+
+
+# ---------------------------------------------------------------------------
+# Document summary
+# ---------------------------------------------------------------------------
 
 def order_pages(data: pd.DataFrame) -> pd.DataFrame:
     """Order pages inside each Analyse-DB document by seqno."""
@@ -319,6 +373,7 @@ def summarize_documents(pages: pd.DataFrame) -> pd.DataFrame:
         n_distinct_sfdoc_class=("sfdoc_class", "nunique"),
         image_ids=("image_id", join_text),
         seqnos=("seqno", join_text),
+        first_delivery_row=("delivery_row", "min"),
     ).reset_index()
     return documents
 
@@ -342,7 +397,7 @@ def join_mapping(
     mapping: pd.DataFrame,
     documents: pd.DataFrame,
 ) -> pd.DataFrame:
-    """Attach Analyse-DB documents only to the delivered MasterIndex sample."""
+    """Attach Analyse-DB documents to the delivered MasterIndex rows."""
     documents = attach_process_count(documents)
     return mapping.merge(
         documents,
@@ -409,7 +464,7 @@ def build_pages(
     page_labels: pd.DataFrame,
     documents: pd.DataFrame,
 ) -> pd.DataFrame:
-    """Return exact Analyse-DB page rows for usable sampled documents."""
+    """Return exact Analyse-DB page rows for usable mapped documents."""
     usable = documents[documents["is_usable"]].copy()
     if usable.empty:
         return pd.DataFrame()
@@ -437,7 +492,9 @@ def build_pages(
     ].transform("size")
     pages["is_first_page"] = pages["page_number"].eq(1)
     pages["is_last_page"] = pages["page_number"].eq(pages["n_pages"])
-    return make_page_class(pages).reset_index(drop=True)
+    pages = add_pdf_page_number(make_page_class(pages))
+    # page_number needed seqno order above; the output follows Snowflake's order.
+    return pages.sort_values(["stack_id_key", "delivery_row"]).reset_index(drop=True)
 
 
 # ---------------------------------------------------------------------------
@@ -459,6 +516,7 @@ DOCUMENT_COLUMNS = [
     "n_pages",
     "image_ids",
     "seqnos",
+    "first_delivery_row",
     "n_process_ids_for_key",
     "mapping_status",
     "is_usable",
@@ -473,6 +531,9 @@ PAGE_COLUMNS = [
     "subdoc_idx",
     "image_id",
     "seqno",
+    "delivery_row",
+    "pdf_page_number",
+    "pdf_page_number_duplicate",
     "page_number",
     "n_pages",
     "sst",
@@ -514,6 +575,10 @@ def write_frame(data: pd.DataFrame, csv_path: Path, parquet_path: Path) -> None:
 
 def write_outputs(documents: pd.DataFrame, pages: pd.DataFrame) -> None:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    documents = documents.sort_values(
+        ["stack_id_key", "first_delivery_row"],
+        na_position="last",
+    )
     document_columns = [column for column in DOCUMENT_COLUMNS if column in documents]
     page_columns = [column for column in PAGE_COLUMNS if column in pages]
     write_frame(
@@ -529,11 +594,18 @@ def write_outputs(documents: pd.DataFrame, pages: pd.DataFrame) -> None:
     )
 
 
+def print_pdf_page_report(pages: pd.DataFrame) -> None:
+    """How many MasterIndex PDFs the page-number rule placed without a collision."""
+    by_mid = pages.groupby("masterindex_id")["pdf_page_number_duplicate"].any()
+    n_bad = int(by_mid.sum())
+    print(f"\nMIDs with a duplicate pdf_page_number: {n_bad:,} of {len(by_mid):,}")
+
+
 def print_report(documents: pd.DataFrame, pages: pd.DataFrame) -> None:
     print("\nMapping status:")
     print(status_summary(documents).to_string(index=False))
 
-    print(f"\nSample documents: {len(documents):,}")
+    print(f"\nMapped documents: {len(documents):,}")
     print(f"Usable documents: {int(documents['is_usable'].sum()):,}")
     print(f"Output pages: {len(pages):,}")
 
@@ -548,6 +620,7 @@ def print_report(documents: pd.DataFrame, pages: pd.DataFrame) -> None:
         "TB0 documents: "
         f"{pages.loc[pages['page_class'].eq(TB0), DOCUMENT_KEYS].drop_duplicates().shape[0]:,}"
     )
+    print_pdf_page_report(pages)
 
 
 # ---------------------------------------------------------------------------
@@ -608,7 +681,7 @@ def parse_args() -> argparse.Namespace:
 
 def build(args: argparse.Namespace, engine: sqlalchemy.Engine, schema: str) -> None:
     mapping = load_mapping(args.mapping_file)
-    print(f"MasterIndex sample rows: {len(mapping):,}")
+    print(f"MasterIndex rows: {len(mapping):,}")
 
     selected_stack_ids = mapping["stack_id_key"].dropna().unique().tolist()
     page_labels = load_page_labels(engine, schema, selected_stack_ids)
