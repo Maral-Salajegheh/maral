@@ -1,7 +1,8 @@
 """Rank A00 pages for GwG identification tables and build the LLM labelling input.
 
 Upstream (checked before any work; the run stops with a clear message if missing):
-  pnc_model_pages_v2.csv        from pnc_prepare        page labels, MIDs, stacks
+  life_mid_pages.csv            Mapping/output; original class comes only from sst
+  page_inventory.parquet        rendered images in the selected ingestion batch
   OCR cache                     default pnc_ocr_cache_full_v2.jsonl (pnc_inputs ocr);
                                 --ocr-cache old|<path> uses another file, e.g. ocr_cache.jsonl
   rendered page images          from ingestion stage 03 (checked for selected pages)
@@ -41,11 +42,11 @@ from pathlib import Path
 from .config import PipelineConfig
 from .data import read_csv
 from .ocr import load_ocr_cache
-from .pnc_data import population_hash, validate_complete_mids
+import pyarrow.parquet as pq
 
 REQUIRED_COLUMNS = {
-    "page_identity", "masterindex_id", "stack_id", "pdf_page_number", "image_path",
-    "has_label", "page_class", "doc_id", "is_first_page", "training_label_quality",
+    "masterindex_id", "stack_id", "pdf_page_number", "sst",
+    "doc_id", "is_first_page",
 }
 
 # Patterns run on normalised text: lower case, umlauts folded (ä->a, ß->ss), single spaces.
@@ -167,8 +168,10 @@ def describe(path):
 
 def check_upstream(config, args):
     missing = []
-    if not config.model_pages_csv.is_file():
-        missing.append(f"{config.model_pages_csv}  (run: python -m Antrag.Classification.pnc_prepare)")
+    if not args.pages_file.is_file():
+        missing.append(f"{args.pages_file}  (raw Life mapping)")
+    if not config.page_inventory.is_file():
+        missing.append(f"{config.page_inventory}  (rendered-page inventory for this batch)")
     if not args.ocr_path.is_file():
         missing.append(f"{args.ocr_path}  (OCR cache; see --ocr-cache)")
     if args.ausweis_csv and not Path(args.ausweis_csv).is_file():
@@ -177,15 +180,76 @@ def check_upstream(config, args):
         fail("missing upstream files:\n  " + "\n  ".join(missing))
 
 
-def load_pages(config):
-    rows = read_csv(config.model_pages_csv)
-    if not rows:
-        fail(f"{config.model_pages_csv} is empty")
-    absent = REQUIRED_COLUMNS - set(rows[0])
-    if absent:
-        fail(f"{config.model_pages_csv} lacks columns: {sorted(absent)}")
-    validate_complete_mids(rows)
-    return rows
+def iter_mapping_rows(path):
+    """Stream the full mapping; never load the model/training manifest."""
+    if path.suffix.lower() == ".parquet":
+        source = pq.ParquetFile(path)
+        absent = REQUIRED_COLUMNS - set(source.schema_arrow.names)
+        if absent:
+            fail(f"{path} lacks columns: {sorted(absent)}")
+        for batch in source.iter_batches(batch_size=65536):
+            yield from batch.to_pylist()
+    else:
+        with path.open(newline="", encoding="utf-8-sig") as handle:
+            reader = csv.DictReader(handle)
+            absent = REQUIRED_COLUMNS - set(reader.fieldnames or [])
+            if absent:
+                fail(f"{path} lacks columns: {sorted(absent)}")
+            yield from reader
+
+
+def load_pages(config, path):
+    """Select original SST A00/G07 and join only the batch's rendered images.
+
+    No page-class, prediction, training-eligibility or first-page filter is used.
+    MID + page number locates the image; stack is retained in the page identity.
+    """
+    inventory = pq.read_table(config.page_inventory, columns=[
+        "masterindex_id", "source_page_number", "image_path", "status",
+    ]).to_pylist()
+    images = {}
+    for image in inventory:
+        if image["status"] != "success":
+            continue
+        key = (str(image["masterindex_id"]).strip(), int(image["source_page_number"]))
+        if key in images:
+            fail(f"ambiguous rendered page in batch inventory: {key}")
+        if not image["image_path"]:
+            fail(f"empty image_path in batch inventory: {key}")
+        images[key] = str(image["image_path"])
+    matched, seen = [], set()
+    counts = Counter()
+    for raw in iter_mapping_rows(path):
+        counts["mapping_rows"] += 1
+        sst = str(raw["sst"] or "").strip().upper()
+        if sst not in {"A00", "G07"}:
+            continue
+        counts[f"raw_{sst}_pages"] += 1
+        mid = str(raw["masterindex_id"] or "").strip()
+        stack = str(raw["stack_id"] or "").strip()
+        try:
+            number = int(str(raw["pdf_page_number"]).strip())
+        except (TypeError, ValueError):
+            fail(f"invalid pdf_page_number in raw mapping for MID {mid}")
+        if not mid or not stack or number < 1:
+            fail(f"invalid page key in raw mapping: {(stack, mid, number)}")
+        key = (mid, number)
+        if key not in images:
+            counts[f"{sst}_pages_without_batch_image"] += 1
+            continue
+        if key in seen:
+            fail(f"ambiguous mapping for rendered page: {key}")
+        seen.add(key)
+        row = {k: "" if v is None else str(v) for k, v in raw.items()}
+        row.update(sst=sst, masterindex_id=mid, stack_id=stack,
+                   pdf_page_number=str(number), image_path=images[key],
+                   page_identity=f"{stack}|{mid}|{number}")
+        matched.append(row)
+        counts[f"rendered_{sst}_pages"] += 1
+    if not counts["mapping_rows"]:
+        fail(f"{path} is empty")
+    print(f"Raw mapping / batch coverage: {dict(counts)}", flush=True)
+    return matched, dict(counts)
 
 
 def load_ausweis(path):
@@ -239,7 +303,9 @@ def score_pages(a00_rows, ocr, g07_stacks, g07_mids, ausweis, hints, args):
             "doc_id": row["doc_id"],
             "pdf_page_number": int(row["pdf_page_number"]),
             "image_path": row["image_path"],
-            "training_label_quality": row["training_label_quality"],
+            "sst": row["sst"],
+            "page_class": row.get("page_class", ""),
+            "training_label_quality": row.get("training_label_quality", ""),
             "has_ocr": raw is not None,
             "n_fields": len(fields),
             "matched_fields": "|".join(fields),
@@ -305,6 +371,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--batch-id", default=PipelineConfig.batch_id)
     parser.add_argument("--run-name", required=True)
+    parser.add_argument("--pages-file", type=Path, help="Raw life_mid_pages.csv or .parquet; default: config.pages_csv")
     parser.add_argument("--threshold", type=int, default=20, help="New score scale: 20 selects P1/P2; 10 also selects P3 (old threshold 6 is not equivalent)")
     parser.add_argument("--random-below", type=int, default=300, help="Random pages below the threshold (recall check)")
     parser.add_argument("--review-per-group", type=int, default=30)
@@ -321,6 +388,7 @@ def main():
         parser.error("--review-per-group must be positive; --random-below must be nonnegative")
 
     config = PipelineConfig(batch_id=args.batch_id)
+    args.pages_file = args.pages_file or config.pages_csv
     args.ocr_path = {"v2": config.pnc_ocr_cache, "old": config.ocr_cache}.get(args.ocr_cache, Path(args.ocr_cache))
     out_dir = config.classification_output / "gwg" / args.run_name
     if out_dir.exists():
@@ -328,11 +396,11 @@ def main():
     check_upstream(config, args)
 
     # 1. Load and validate upstream
-    pages = load_pages(config)
-    a00_rows = [r for r in pages if r["page_class"] == "A00"]
+    pages, mapping_counts = load_pages(config, args.pages_file)
+    a00_rows = [r for r in pages if r["sst"] == "A00"]
     if not a00_rows:
-        fail("no A00 pages in the model population")
-    g07_rows = [r for r in pages if r["page_class"] == "G07"]
+        fail("no raw sst=A00 pages matched the rendered images in this batch")
+    g07_rows = [r for r in pages if r["sst"] == "G07"]
     if not g07_rows:
         print("WARNING: no G07 pages; the G07 signal is inactive")
     print(f"Loading OCR cache: {args.ocr_path}", flush=True)
@@ -391,7 +459,7 @@ def main():
             handle.write(json.dumps(record, ensure_ascii=False) + "\n")
 
     review_rows = [{**{k: row[k] for k in ("page_identity", "masterindex_id", "stack_id", "pdf_page_number",
-                                            "image_path", "priority", "priority_reason", "score", "context_score",
+                                            "image_path", "sst", "page_class", "priority", "priority_reason", "score", "context_score",
                                             "identification_signals", "local_specific_fields", "matched_fields", "product_hint")},
                     "review_group": group, "is_gwg_page": "", "table_completeness": "", "product_type": "",
                     "gwg_layout": "", "reviewer": "", "comment": ""}
@@ -404,11 +472,13 @@ def main():
         "run_name": args.run_name,
         "parameters": {k: (str(v) if isinstance(v, Path) else v) for k, v in vars(args).items() if k not in {"batch_id", "run_name"}},
         "inputs": {
-            "model_pages_csv": describe(config.model_pages_csv),
+            "raw_pages": describe(args.pages_file),
+            "page_inventory": describe(config.page_inventory),
             "ocr_cache": describe(args.ocr_path),
             **({"ausweis_csv": describe(args.ausweis_csv)} if args.ausweis_csv else {}),
         },
-        "model_population_hash": population_hash(pages),
+        "selection_rule": "raw mapping sst=A00 intersect successful rendered pages in selected batch; page_class is informational only",
+        "mapping_counts": mapping_counts,
         "ranking_version": "gwg_text_priority_v2",
         "priority_rules": {
             "P1": "identification phrase plus at least 3 distinct document fields in local OCR text",
