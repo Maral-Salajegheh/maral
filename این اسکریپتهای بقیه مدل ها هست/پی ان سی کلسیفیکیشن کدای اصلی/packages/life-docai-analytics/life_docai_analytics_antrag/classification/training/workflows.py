@@ -5,13 +5,14 @@ Every function takes the parsed CLI arguments from main.py.
 
 import hashlib
 import json
-from collections import Counter
+import random
+from collections import Counter, defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
+from torch.utils.data import DataLoader, Dataset, Sampler, WeightedRandomSampler
 
 from .config import CLASSES, CLIP_MODEL_NAME, CLIP_MODEL_PATH, ID_TO_CLASS, TEXT_MODEL_NAME, PipelineConfig
 from .data import (IGNORE_INDEX, build_stack_sequences, load_model_pages, population_hash, rows_for_split,
@@ -19,10 +20,11 @@ from .data import (IGNORE_INDEX, build_stack_sequences, load_model_pages, popula
 from .evaluation import binary_metrics, classification_metrics, write_csv_new, write_json_new
 from .models import PageClassifier, SequenceModelRNN
 from .ocr import build_ocr_cache, load_ocr_cache
+from .storage import ClipFeatureStore, Stage1Features
 
-STAGE1_ARCHITECTURE = "PnC_BertPageModel_LifePort_v2"
-STAGE2_ARCHITECTURE = "PnC_SequenceModelRNN_LifeStackPort_v3"
-FEATURE_FORMAT = "PnC_trained_stage1_features_v3_stack"
+STAGE1_ARCHITECTURE = "BertPageModel"
+STAGE2_ARCHITECTURE = "SequenceModelRNN"
+POPULATION = "stack"
 
 
 def _config(args):
@@ -54,11 +56,14 @@ def _check_new(*paths):
 def compute_ocr(args):
     config = _config(args)
     rows = training_subset(config, load_model_pages(config), args.limit_stacks, args.training_limit_stacks, args.seed)
-    build_ocr_cache(config.pnc_ocr_cache, rows, config.render_root, workers=args.workers)
+    build_ocr_cache(config.ocr_text_file, rows, config.render_root, workers=args.workers)
 
 
-def compute_visual_embeddings(args, checkpoint_every=50):
-    """As PnC compute_visual_embeddings: frozen OpenCLIP ViT-H-14 visual tower, cached once."""
+def compute_visual_embeddings(args):
+    """As PnC compute_visual_embeddings: frozen OpenCLIP ViT-H-14 visual tower, cached once.
+
+    Vectors go into write-once shards, so adding pages never rewrites what is already stored.
+    """
     import open_clip
     from PIL import Image
     from safetensors.torch import load_file
@@ -66,16 +71,11 @@ def compute_visual_embeddings(args, checkpoint_every=50):
 
     config = _config(args)
     rows = training_subset(config, load_model_pages(config), args.limit_stacks, args.training_limit_stacks, args.seed)
-    cache_path = config.pnc_clip_feature_file
-    features = torch.load(cache_path, map_location="cpu") if cache_path.exists() else {}
-    pending = [row for row in rows if row["image_path"] not in features]
-    print(f"clip_cached={len(features)} pending={len(pending)}")
+    store = ClipFeatureStore(config.clip_features_dir)
+    pending = [row for row in rows if row["image_path"] not in store]
+    print(f"clip_cached={len(store)} pending={len(pending)}")
     if not pending:
         return
-
-    def save():
-        tmp = cache_path.with_suffix(".pt.tmp"); torch.save(features, tmp); tmp.replace(cache_path)
-
     model, _, preprocess = open_clip.create_model_and_transforms(CLIP_MODEL_NAME)
     model.load_state_dict(load_file(CLIP_MODEL_PATH))
     visual = model.visual.eval().requires_grad_(False).to(_device(args))
@@ -89,24 +89,34 @@ def compute_visual_embeddings(args, checkpoint_every=50):
                 return index, preprocess(image.convert("RGB"))
 
     loader = DataLoader(Pages(), batch_size=args.batch_size, shuffle=False, num_workers=2)
-    cache_path.parent.mkdir(parents=True, exist_ok=True)
     with torch.no_grad():
-        for batch_index, (indices, images) in enumerate(tqdm(loader, desc="clip"), start=1):
+        for indices, images in tqdm(loader, desc="clip"):
             for index, vector in zip(indices.tolist(), visual(images.to(_device(args))).cpu()):
-                features[pending[index]["image_path"]] = vector
-            if batch_index % checkpoint_every == 0:
-                save()
-    save()
-    print(f"clip_features={cache_path} rows={len(features)}")
+                store.add(pending[index]["image_path"], vector.numpy())
+    store.flush()
+    print(f"clip_features={config.clip_features_dir} rows={len(store)}")
+
+
+def migrate_clip_cache(args):
+    """One-time conversion of an old single-file CLIP cache ({image_path: tensor}) into shards."""
+    config = _config(args)
+    store = ClipFeatureStore(config.clip_features_dir)
+    old = torch.load(args.source, map_location="cpu")
+    added = 0
+    for image_path, vector in old.items():
+        if image_path not in store:
+            store.add(image_path, vector.float().numpy()); added += 1
+    store.flush()
+    print(f"migrated={added} already_present={len(old) - added} total={len(store)} -> {config.clip_features_dir}")
 
 
 def load_inputs(config, modality):
-    ocr = load_ocr_cache(config.pnc_ocr_cache) if modality in {"text", "fusion"} else {}
+    ocr = load_ocr_cache(config.ocr_text_file) if modality in {"text", "fusion"} else {}
     clip = {}
     if modality in {"vision", "fusion"}:
-        if not config.pnc_clip_feature_file.exists():
-            raise FileNotFoundError(f"Missing CLIP cache: {config.pnc_clip_feature_file}")
-        clip = torch.load(config.pnc_clip_feature_file, map_location="cpu")
+        clip = ClipFeatureStore(config.clip_features_dir)   # memory-mapped, read page by page
+        if not len(clip):
+            raise FileNotFoundError(f"Missing CLIP features: {config.clip_features_dir}")
     return ocr, clip
 
 
@@ -218,7 +228,7 @@ def stage1_epoch(model, loader, optimizer, device, use_fp16=False, use_bf16=Fals
 
 
 def _stage1_metadata(model, modality, rows):
-    return {"architecture": STAGE1_ARCHITECTURE, "population": "stack_v3", "modality": modality,
+    return {"architecture": STAGE1_ARCHITECTURE, "population": POPULATION, "modality": modality,
             "classes": list(CLASSES), "class_to_id": {label: index for index, label in ID_TO_CLASS.items()},
             "embedding_dim": model.embedding_dim, "clip_input_dim": 1024,
             "population_hash": population_hash(rows), "population_pages": len(rows), "text_model_name": TEXT_MODEL_NAME}
@@ -234,8 +244,8 @@ def _save_checkpoint(path, model, optimizer, epoch, best, metadata):
 def load_stage1_checkpoint(path, device):
     payload = torch.load(path, map_location=device)
     metadata = payload.get("metadata") or {}
-    if metadata.get("architecture") != STAGE1_ARCHITECTURE or metadata.get("population") != "stack_v3":
-        raise ValueError(f"Incompatible Stage 1 checkpoint (needs a stack_v3 checkpoint): {path}")
+    if metadata.get("architecture") != STAGE1_ARCHITECTURE or metadata.get("population") != POPULATION:
+        raise ValueError(f"Incompatible Stage 1 checkpoint (needs a stack-level checkpoint): {path}")
     model = PageClassifier(TEXT_MODEL_NAME, len(CLASSES), modality=metadata["modality"],
                            clip_input_dim=metadata["clip_input_dim"]).to(device)
     model.load_state_dict(payload["model"])
@@ -271,16 +281,17 @@ def train_stage1(args):
             for group in optimizer.param_groups:  # PnC: lr -> 2e-6 after 40,000 iterations
                 group["lr"] = args.lr_decay_to
             print(f"lr set to {args.lr_decay_to} from epoch {epoch}")
-        result_path = config.results_dir / f"pnc_stage1_{run}_{args.modality}_epoch_{epoch:03d}.json"
-        epoch_path = config.checkpoints_dir / f"pnc_stage1_{run}_{args.modality}_epoch_{epoch:03d}.pt"
+        result_path = config.results_dir / f"metrics_stage1_{args.modality}_{run}_epoch_{epoch:03d}.json"
+        epoch_path = config.checkpoints_dir / f"model_stage1_{args.modality}_{run}_epoch_{epoch:03d}.pt"
         _check_new(result_path, epoch_path)
         train_metrics = stage1_epoch(model, train_loader, optimizer, device, args.use_fp16, args.use_bf16, scaler)
         val_metrics = stage1_epoch(model, val_loader, None, device, args.use_fp16, args.use_bf16)
-        write_json_new(result_path, {"epoch": epoch, "train": train_metrics, "val": val_metrics, "sampling": report})
+        write_json_new(result_path, {"epoch": epoch, "train": train_metrics, "val": val_metrics,
+                                     "balance_classes": args.balance_classes, "sampling": report})
         _save_checkpoint(epoch_path, model, optimizer, epoch, max(best, val_metrics["macro_f1"]), metadata)
         if val_metrics["macro_f1"] > best:
             best = val_metrics["macro_f1"]
-            _save_checkpoint(config.checkpoints_dir / f"pnc_stage1_{run}_{args.modality}_best_epoch_{epoch:03d}.pt",
+            _save_checkpoint(config.checkpoints_dir / f"model_stage1_{args.modality}_{run}_best_epoch_{epoch:03d}.pt",
                              model, optimizer, epoch, best, metadata)
         print(json.dumps({"epoch": epoch, "val_macro_f1": val_metrics["macro_f1"], "checkpoint": str(epoch_path)}))
 
@@ -330,10 +341,13 @@ def predict_stage1(args):
 # Stage 1 -> Stage 2: frozen trained page representations (PnC precompute_bert_features)
 # ===========================================================================
 
+def default_features_dir(config, checkpoint, modality):
+    name = Path(checkpoint).stem.removeprefix("model_stage1_").removeprefix(f"{modality}_")
+    return config.stage1_features_dir(name, modality)
+
+
 def precompute_features(args):
     config, device = _config(args), _device(args)
-    output = Path(args.output)
-    _check_new(output)
     rows = load_model_pages(config)
     selected = training_subset(config, rows, args.limit_stacks, args.training_limit_stacks, args.seed)
     model, payload = load_stage1_checkpoint(args.stage1_checkpoint, device)
@@ -343,64 +357,76 @@ def precompute_features(args):
     modality = payload["metadata"]["modality"]
     if modality == "vision":
         print("WARNING: vision Stage 1 returns the raw CLIP vector; Stage 2 gets no Stage 1 training (PnC: debug only)")
+    output = Path(args.output) if args.output else default_features_dir(config, args.stage1_checkpoint, modality)
+    dim = 2048 if modality == "fusion" else 1024
+    writer = Stage1Features.create(output, len(selected), dim)
     ocr, clip = load_inputs(config, modality)
     loader = DataLoader(Stage1Dataset(selected, modality, ocr, clip), batch_size=args.batch_size, shuffle=False,
                         collate_fn=lambda batch: collate_stage1(batch, model, modality))
-    blocks, pages = [], []
+    pages, row = [], 0
     with torch.no_grad():
         for batch in loader:
             visual = batch.get("visual"); text = batch.get("text")
             visual = visual.to(device) if visual is not None else None
             text = {key: value.to(device) for key, value in text.items()} if text is not None else None
             h = model(visual, text, return_embeddings=True)
-            blocks.append((torch.cat((h[:, :1024], visual), dim=1) if modality == "fusion" else h).cpu())  # as PnC
-            pages += [{"page_identity": r["page_identity"], "stack_id": r["stack_id"], "stack_position": int(r["stack_position"]),
-                       "image_id": r["image_id"], "masterindex_id": r["masterindex_id"], "pdf_page_number": r["pdf_page_number"],
-                       "class_target": int(r["class_target"]), "segmentation_target": int(r["segmentation_target"]),
-                       "last_page_target": int(r["last_page_target"]), "page_class": r["page_class"],
-                       "training_label_quality": r["training_label_quality"]} for r in batch["rows"]]
-    dim = 2048 if modality == "fusion" else 1024
-    features = torch.cat(blocks) if blocks else torch.zeros((0, dim))
-    if features.shape != (len(pages), dim):
-        raise ValueError(f"Feature shape mismatch: {tuple(features.shape)}, expected {(len(pages), dim)}")
-    metadata = {"format": FEATURE_FORMAT, "stage1_checkpoint": str(Path(args.stage1_checkpoint).resolve()),
-                "stage1_checkpoint_sha256": file_sha256(args.stage1_checkpoint), "modality": modality,
-                "feature_dim": dim, "page_count": len(pages), "stack_count": len({p["stack_id"] for p in pages}),
-                "full_population_hash": population_hash(rows), "selected_population_hash": population_hash(selected),
-                "ordering": "stack_id,stack_position (image_id order)"}
-    output.parent.mkdir(parents=True, exist_ok=True)
-    torch.save({"metadata": metadata, "pages": pages, "features": features}, output)
+            block = (torch.cat((h[:, :1024], visual), dim=1) if modality == "fusion" else h).float().cpu().numpy()  # as PnC
+            if block.shape[1] != dim:
+                raise ValueError(f"Feature dimension {block.shape[1]}, expected {dim}")
+            writer[row:row + len(block)] = block
+            for r in batch["rows"]:
+                pages.append({"row": row, "page_identity": r["page_identity"], "stack_id": r["stack_id"],
+                              "stack_position": r["stack_position"], "image_id": r["image_id"],
+                              "masterindex_id": r["masterindex_id"], "pdf_page_number": r["pdf_page_number"],
+                              "class_target": r["class_target"], "segmentation_target": r["segmentation_target"],
+                              "last_page_target": r["last_page_target"], "page_class": r["page_class"],
+                              "training_label_quality": r["training_label_quality"]})
+                row += 1
+    if row != len(selected):
+        raise ValueError(f"Wrote {row} feature rows, expected {len(selected)}")
+    Stage1Features.finish(output, writer, pages, {
+        "stage1_checkpoint": str(Path(args.stage1_checkpoint).resolve()),
+        "stage1_checkpoint_sha256": file_sha256(args.stage1_checkpoint), "modality": modality,
+        "feature_dim": dim, "page_count": len(pages), "stack_count": len({p["stack_id"] for p in pages}),
+        "full_population_hash": population_hash(rows), "selected_population_hash": population_hash(selected),
+        "ordering": "stack_id,stack_position (original page order); each stack is one contiguous block of rows"})
     print(output)
 
 
-def load_feature_cache(config, feature_cache, stage1_checkpoint):
-    cache = torch.load(feature_cache, map_location="cpu")
-    metadata = cache.get("metadata", {})
-    if metadata.get("format") != FEATURE_FORMAT:
-        raise ValueError("Stale or incompatible Stage 1 feature-cache format (needs a v3 stack cache)")
+def load_stage1_features(config, directory, stage1_checkpoint):
+    """Validate a feature directory; returns (store, sequences). Feature rows stay on disk."""
+    store = Stage1Features(directory)
+    metadata = store.metadata
     if metadata.get("stage1_checkpoint_sha256") != file_sha256(stage1_checkpoint):
-        raise ValueError("Stage 1 checkpoint does not match feature cache")
+        raise ValueError("Stage 1 checkpoint does not match the Stage 1 features")
     rows = load_model_pages(config)
     if metadata.get("full_population_hash") != population_hash(rows):
-        raise ValueError("Feature cache population is stale")
-    pages, features = cache.get("pages", []), cache.get("features")
-    if features is None or features.ndim != 2 or len(pages) != len(features) or metadata.get("page_count") != len(pages) \
-            or metadata.get("feature_dim") != features.shape[1]:
-        raise ValueError("Feature cache tensor or its metadata is inconsistent")
+        raise ValueError("Stage 1 features were built for another population; rebuild them")
+    if metadata.get("page_count") != len(store.pages) or tuple(store.features.shape) != (len(store.pages), metadata.get("feature_dim")):
+        raise ValueError("Stage 1 feature files are inconsistent")
     current = {row["page_identity"]: row for row in rows}
-    enriched, seen = [], set()
-    for index, page in enumerate(pages):
+    by_stack, seen = defaultdict(list), set()
+    for page in store.pages:
         identity = page["page_identity"]
         if identity in seen or identity not in current:
-            raise ValueError(f"Duplicate or stale page identity in feature cache: {identity}")
+            raise ValueError(f"Duplicate or stale page in Stage 1 features: {identity}")
         seen.add(identity)
         for field in ["stack_id", "stack_position", "image_id", "class_target", "segmentation_target"]:
             if str(current[identity][field]) != str(page[field]):
-                raise ValueError(f"Feature-cache metadata mismatch for {identity}: {field}")
-        enriched.append({**page, "feature_index": index})
-    if metadata.get("selected_population_hash") != population_hash([current[p["page_identity"]] for p in pages]):
-        raise ValueError("Feature cache selected population is stale or reordered")
-    return cache, enriched, features
+                raise ValueError(f"Stage 1 features disagree with the page table for {identity}: {field}")
+        by_stack[page["stack_id"]].append({**page, "row": int(page["row"]), "stack_position": int(page["stack_position"]),
+                                           "class_target": int(page["class_target"]),
+                                           "segmentation_target": int(page["segmentation_target"])})
+    if metadata.get("selected_population_hash") != population_hash([current[p["page_identity"]] for p in store.pages]):
+        raise ValueError("Stage 1 features are stale or reordered")
+    sequences = []
+    for stack_id, pages in sorted(by_stack.items()):
+        pages.sort(key=lambda p: p["stack_position"])
+        if [p["stack_position"] for p in pages] != list(range(1, len(pages) + 1)) or \
+                [p["row"] for p in pages] != list(range(pages[0]["row"], pages[0]["row"] + len(pages))):
+            raise ValueError(f"Stack {stack_id} is not one ordered block in the Stage 1 features")
+        sequences.append({"stack_id": stack_id, "start": pages[0]["row"], "end": pages[-1]["row"] + 1, "pages": pages})
+    return store, sequences
 
 
 # ===========================================================================
@@ -408,18 +434,20 @@ def load_feature_cache(config, feature_cache, stage1_checkpoint):
 # ===========================================================================
 
 class StackSequenceDataset(Dataset):
-    def __init__(self, sequences, features):
-        self.sequences, self.features = sequences, features
+    """Reads one stack's feature rows from the memory-mapped Stage 1 features."""
+
+    def __init__(self, sequences, store):
+        self.sequences, self.store = sequences, store
 
     def __len__(self):
         return len(self.sequences)
 
     def __getitem__(self, index):
         sequence = self.sequences[index]
-        return {"rows": sequence,
-                "features": self.features[[row["feature_index"] for row in sequence]].float(),
-                "class_targets": torch.tensor([row["class_target"] for row in sequence]),
-                "segmentation_targets": torch.tensor([row["segmentation_target"] for row in sequence])}
+        return {"rows": sequence["pages"],
+                "features": self.store.rows(sequence["start"], sequence["end"]),
+                "class_targets": torch.tensor([p["class_target"] for p in sequence["pages"]]),
+                "segmentation_targets": torch.tensor([p["segmentation_target"] for p in sequence["pages"]])}
 
 
 def collate_sequences(batch):
@@ -437,18 +465,52 @@ def collate_sequences(batch):
             "rows": [item["rows"] for item in batch]}
 
 
-def _stage2_loader(sequences, features, batch_size, train, balance):
-    sampler, report = None, None
+class LengthBatchSampler(Sampler):
+    """Batches of stacks with similar length, at most max_pages padded pages per batch.
+
+    With weights, each epoch first draws len(stacks) stacks with replacement (balancing), then groups them.
+    Padding sits at the end and the GRU is unidirectional, so grouping does not change any prediction.
+    """
+
+    def __init__(self, lengths, max_pages, shuffle, weights=None, seed=13):
+        self.lengths, self.max_pages, self.shuffle, self.weights = lengths, max_pages, shuffle, weights
+        self.rng = random.Random(seed)
+
+    def _batches(self):
+        if self.weights is not None:
+            drawn = torch.multinomial(torch.tensor(self.weights, dtype=torch.double), len(self.lengths), replacement=True).tolist()
+        else:
+            drawn = list(range(len(self.lengths)))
+        drawn.sort(key=lambda i: self.lengths[i])
+        batches, current, longest = [], [], 0
+        for i in drawn:
+            if current and max(longest, self.lengths[i]) * (len(current) + 1) > self.max_pages:
+                batches.append(current); current, longest = [], 0
+            current.append(i); longest = max(longest, self.lengths[i])
+        if current:
+            batches.append(current)
+        if self.shuffle:
+            self.rng.shuffle(batches)
+        return batches
+
+    def __iter__(self):
+        return iter(self._batches())
+
+    def __len__(self):
+        return len(self._batches()) if self.weights is None else max(1, sum(self.lengths) // self.max_pages)
+
+
+def _stage2_loader(sequences, store, max_pages, train, balance):
+    weights, report = None, None
     if train and balance:  # as PnC: max inverse page-class frequency per sequence
-        counts = Counter(page["class_target"] for sequence in sequences for page in sequence)
-        weights = [max(1 / counts[page["class_target"]] for page in sequence) for sequence in sequences]
-        sampler = WeightedRandomSampler(weights, num_samples=len(sequences), replacement=True)
+        counts = Counter(p["class_target"] for s in sequences for p in s["pages"])
+        weights = [max(1 / counts[p["class_target"]] for p in s["pages"]) for s in sequences]
         total = sum(weights)
         report = {"expected_supervised_pages_per_epoch": {
-            ID_TO_CLASS[c]: len(sequences) * sum(w * sum(p["class_target"] == c for p in s) for s, w in zip(sequences, weights)) / total
-            for c in counts}}
-    loader = DataLoader(StackSequenceDataset(sequences, features), batch_size=batch_size, sampler=sampler,
-                        shuffle=train and sampler is None, collate_fn=collate_sequences)
+            ID_TO_CLASS[c]: len(sequences) * sum(w * sum(p["class_target"] == c for p in s["pages"])
+                                                 for s, w in zip(sequences, weights)) / total for c in counts}}
+    sampler = LengthBatchSampler([len(s["pages"]) for s in sequences], max_pages, shuffle=train, weights=weights)
+    loader = DataLoader(StackSequenceDataset(sequences, store), batch_sampler=sampler, collate_fn=collate_sequences)
     return loader, report
 
 
@@ -458,8 +520,10 @@ def stage2_epoch(model, loader, optimizer, device):
     criterion = nn.CrossEntropyLoss(ignore_index=IGNORE_INDEX)
     total_loss = 0.0
     class_true, class_pred, seg_true, seg_pred = [], [], [], []
+    batches = 0
     with torch.set_grad_enabled(train):
         for batch in loader:
+            batches += 1
             features = batch["features"].to(device)
             class_targets, seg_targets = batch["class_targets"].to(device), batch["segmentation_targets"].to(device)
             pred_seg, pred_class = model(features)
@@ -474,29 +538,30 @@ def stage2_epoch(model, loader, optimizer, device):
             seg_true += seg_targets[seg_mask].cpu().tolist(); seg_pred += pred_seg.argmax(-1)[seg_mask].cpu().tolist()
     result = classification_metrics(class_true, class_pred)
     result["segmentation"] = binary_metrics(seg_true, seg_pred)  # stack position 1 excluded
-    result["loss"] = total_loss / max(len(loader), 1)
+    result["loss"] = total_loss / max(batches, 1)
     return result
 
 
-def _stage2_metadata(cache, args, input_dim):
+def _stage2_metadata(store, args, input_dim):
     return {"architecture": STAGE2_ARCHITECTURE, "classes": list(CLASSES),
             "class_to_id": {label: index for index, label in ID_TO_CLASS.items()},
-            "modality": cache["metadata"]["modality"], "input_dim": input_dim, "hidden_dim": 1024,
+            "modality": store.metadata["modality"], "input_dim": input_dim, "hidden_dim": 1024,
             "stage1_checkpoint": str(Path(args.stage1_checkpoint).resolve()),
             "stage1_checkpoint_sha256": file_sha256(args.stage1_checkpoint),
-            "feature_cache": str(Path(args.feature_cache).resolve()), "feature_cache_sha256": file_sha256(args.feature_cache),
-            "feature_cache_metadata": cache["metadata"]}
+            "stage1_features": str(Path(args.stage1_features).resolve()),
+            "stage1_features_metadata_sha256": store.metadata_sha256(),
+            "stage1_features_metadata": store.metadata}
 
 
-def load_stage2_checkpoint(args, device):
-    payload = torch.load(args.checkpoint, map_location=device)
+def load_stage2_checkpoint(args, store, device, path=None):
+    payload = torch.load(path or args.checkpoint, map_location=device)
     metadata = payload.get("metadata", {})
     if metadata.get("architecture") != STAGE2_ARCHITECTURE:
         raise ValueError("Incompatible Stage 2 checkpoint")
     if metadata.get("stage1_checkpoint_sha256") != file_sha256(args.stage1_checkpoint):
         raise ValueError("Stage 1 checkpoint mismatch")
-    if metadata.get("feature_cache_sha256") != file_sha256(args.feature_cache):
-        raise ValueError("Stage 1 feature cache mismatch")
+    if metadata.get("stage1_features_metadata_sha256") != store.metadata_sha256():
+        raise ValueError("Stage 1 features mismatch")
     model = SequenceModelRNN(False, len(CLASSES), input_dim=metadata["input_dim"]).to(device)
     model.load_state_dict(payload["model"])
     return model, payload
@@ -504,31 +569,32 @@ def load_stage2_checkpoint(args, device):
 
 def train_stage2(args):
     config, device = _config(args), _device(args)
-    cache, pages, features = load_feature_cache(config, args.feature_cache, args.stage1_checkpoint)
+    store, sequences = load_stage1_features(config, args.stage1_features, args.stage1_checkpoint)
     assignments = split_assignments(config, load_model_pages(config), args.seed)
-    train_seq = build_stack_sequences([p for p in pages if assignments[p["stack_id"]] == "train"])
-    val_seq = build_stack_sequences([p for p in pages if assignments[p["stack_id"]] == "val"])
+    train_seq = [s for s in sequences if assignments[s["stack_id"]] == "train"]
+    val_seq = [s for s in sequences if assignments[s["stack_id"]] == "val"]
     if args.limit_stacks:
         train_seq, val_seq = train_seq[:args.limit_stacks], val_seq[:max(1, args.limit_stacks // 4)]
     if not train_seq or not val_seq:
-        raise ValueError("The feature cache holds no train or no val stacks")
-    model = SequenceModelRNN(False, len(CLASSES), lr=args.lr, input_dim=features.shape[1]).to(device)
+        raise ValueError("The Stage 1 features hold no train or no val stacks")
+    dim = store.metadata["feature_dim"]
+    model = SequenceModelRNN(False, len(CLASSES), lr=args.lr, input_dim=dim).to(device)
     optimizer = model.get_optimizer()
-    metadata = _stage2_metadata(cache, args, features.shape[1])
+    metadata = _stage2_metadata(store, args, dim)
     start, best = 0, -1.0
     if args.resume:
-        resume_args = type(args)(**{**vars(args), "checkpoint": args.resume})
-        model, payload = load_stage2_checkpoint(resume_args, device)
+        model, payload = load_stage2_checkpoint(args, store, device, path=args.resume)
         optimizer = model.get_optimizer(); optimizer.load_state_dict(payload["optimizer"])
         start, best = payload["epoch"] + 1, payload["best_macro_f1"]
-    train_loader, report = _stage2_loader(train_seq, features, args.batch_size, True, args.balance_classes)
-    val_loader, _ = _stage2_loader(val_seq, features, args.batch_size, False, False)
-    summary = {"sampling": report, "train_stacks": len(train_seq), "val_stacks": len(val_seq)}
+    train_loader, report = _stage2_loader(train_seq, store, args.max_pages_per_batch, True, args.balance_classes)
+    val_loader, _ = _stage2_loader(val_seq, store, args.max_pages_per_batch, False, False)
+    summary = {"balance_classes": args.balance_classes, "sampling": report, "max_pages_per_batch": args.max_pages_per_batch,
+               "train_stacks": len(train_seq), "val_stacks": len(val_seq)}
     print(json.dumps(summary, indent=2))
-    run, modality = args.run_name or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ"), cache["metadata"]["modality"]
+    run, modality = args.run_name or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ"), store.metadata["modality"]
     for epoch in range(start, args.epochs):
-        result_path = config.results_dir / f"pnc_stage2_{run}_{modality}_epoch_{epoch:03d}.json"
-        epoch_path = config.checkpoints_dir / f"pnc_stage2_{run}_{modality}_epoch_{epoch:03d}.pt"
+        result_path = config.results_dir / f"metrics_final_{modality}_{run}_epoch_{epoch:03d}.json"
+        epoch_path = config.checkpoints_dir / f"model_final_{modality}_{run}_epoch_{epoch:03d}.pt"
         _check_new(result_path, epoch_path)
         train_metrics = stage2_epoch(model, train_loader, optimizer, device)
         val_metrics = stage2_epoch(model, val_loader, None, device)
@@ -536,38 +602,39 @@ def train_stage2(args):
         _save_checkpoint(epoch_path, model, optimizer, epoch, max(best, val_metrics["macro_f1"]), metadata)
         if val_metrics["macro_f1"] > best:
             best = val_metrics["macro_f1"]
-            _save_checkpoint(config.checkpoints_dir / f"pnc_stage2_{run}_{modality}_best_epoch_{epoch:03d}.pt",
+            _save_checkpoint(config.checkpoints_dir / f"model_final_{modality}_{run}_best_epoch_{epoch:03d}.pt",
                              model, optimizer, epoch, best, metadata)
         print(json.dumps({"epoch": epoch, "val_macro_f1": val_metrics["macro_f1"], "checkpoint": str(epoch_path)}))
 
 
 def evaluate_stage2(args):
     config, device = _config(args), _device(args)
-    cache, pages, features = load_feature_cache(config, args.feature_cache, args.stage1_checkpoint)
+    store, sequences = load_stage1_features(config, args.stage1_features, args.stage1_checkpoint)
     assignments = split_assignments(config, load_model_pages(config), args.seed)
-    sequences = build_stack_sequences([p for p in pages if assignments[p["stack_id"]] == args.split])
+    sequences = [s for s in sequences if assignments[s["stack_id"]] == args.split]
     if not sequences:
-        raise ValueError(f"The feature cache holds no stacks of split {args.split}")
-    model, _ = load_stage2_checkpoint(args, device)
-    loader, _ = _stage2_loader(sequences, features, args.batch_size, False, False)
+        raise ValueError(f"The Stage 1 features hold no stacks of split {args.split}")
+    model, _ = load_stage2_checkpoint(args, store, device)
+    loader, _ = _stage2_loader(sequences, store, args.max_pages_per_batch, False, False)
     write_json_new(Path(args.output), stage2_epoch(model, loader, None, device))
     print(args.output)
 
 
 def predict_stage2(args):
     config, device = _config(args), _device(args)
-    cache, pages, features = load_feature_cache(config, args.feature_cache, args.stage1_checkpoint)
-    sequences = build_stack_sequences(pages)[:args.limit_stacks] if args.limit_stacks else build_stack_sequences(pages)
-    model, _ = load_stage2_checkpoint(args, device)
+    store, sequences = load_stage1_features(config, args.stage1_features, args.stage1_checkpoint)
+    if args.limit_stacks:
+        sequences = sequences[:args.limit_stacks]
+    model, _ = load_stage2_checkpoint(args, store, device)
     model.eval()
-    loader, _ = _stage2_loader(sequences, features, args.batch_size, False, False)
+    loader, _ = _stage2_loader(sequences, store, args.max_pages_per_batch, False, False)
     output = []
     with torch.no_grad():
         for batch in loader:
             pred_seg, pred_class = model(batch["features"].to(device))
             seg_probs, class_probs = torch.softmax(pred_seg, -1).cpu(), torch.softmax(pred_class, -1).cpu()
-            for s, sequence in enumerate(batch["rows"]):
-                for i, page in enumerate(sequence):
+            for s, pages in enumerate(batch["rows"]):
+                for i, page in enumerate(pages):
                     cp = class_probs[s, i]
                     row = {k: page[k] for k in ["page_identity", "stack_id", "stack_position", "image_id", "masterindex_id",
                                                 "pdf_page_number", "page_class", "segmentation_target"]}
@@ -577,5 +644,6 @@ def predict_stage2(args):
                     output.append(row)
     if not output:
         raise ValueError("No pages to predict")
+    output.sort(key=lambda r: (r["stack_id"], int(r["stack_position"])))   # batches are grouped by length
     write_csv_new(Path(args.output), output, list(output[0]))
     print(args.output)

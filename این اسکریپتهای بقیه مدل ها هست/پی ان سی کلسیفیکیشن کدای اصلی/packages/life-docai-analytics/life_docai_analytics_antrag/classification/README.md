@@ -60,20 +60,36 @@ population report counts the fallback cases by reason.
 
 ## Package layout
 
+The code is part of the `life_docai_analytics_antrag` package:
+
+```
+packages/life-docai-analytics/
+└── life_docai_analytics_antrag/
+    ├── classification/          this pipeline (below)
+    ├── datasets/
+    │   ├── aws_download_ingestion/   page inventory and rendered images
+    │   └── mapping/                  page labels and document table
+    └── __init__.py
+```
+
+All paths are derived from the package folder in `training/config.py`, so the
+pipeline does not depend on the current working directory.
+
 ```
 classification/
 ├── training/
 │   ├── config.py       paths, classes, model locations (env-overridable)
 │   ├── data.py         stack population, document key, splits, sequences
 │   ├── models.py       Stage 1 page model, Stage 2 sequence model
-│   ├── ocr.py          OCR cache (JSONL keyed by image path)
+│   ├── ocr.py          OCR text per page (JSONL keyed by image path)
+│   ├── storage.py      memory-mapped stores: CLIP shards, Stage 1 features
 │   ├── workflows.py    caches, Stage 1, feature extraction, Stage 2
 │   ├── evaluation.py   metrics, write-once result files
 │   └── main.py         single command-line entry point
 ├── gwg/                optional: candidate ranking and LLM labelling
-├── output/<batch_id>/  population, caches, features, checkpoints
+├── output/<batch_id>/  stack pages, page caches, Stage 1 features, checkpoints
+├── results/<batch_id>/ metrics, evaluations and prediction files
 └── README.md
-results/<batch_id>/     metrics and prediction files (next to classification/)
 ```
 
 ## Input data
@@ -101,18 +117,21 @@ excluded, because its pages would be missing from the sequence.
 **3. Page inventory** (Parquet, from rendering) with `masterindex_id`,
 `source_page_number`, `image_path`, `image_sha256` and `status`. Only rows
 with `status == "success"` are used. `image_path` is relative to the
-ingestion folder and is the key of the OCR and CLIP caches.
+ingestion folder and is the key of the OCR text and CLIP features.
 
 **Model weights**: a BERT-type text encoder (hidden size 1024) and OpenCLIP
 ViT-H-14 weights. Set their locations with the environment variables below.
 
 ## Setup
 
-Run every command from the repository root, inside the project environment:
+Run every command from the repository root, inside the project environment.
+If the package is installed in the environment (for example as an editable
+install), no `PYTHONPATH` is needed; otherwise point it at the package's parent
+folder:
 
 ```bash
 cd <repository root>
-export PYTHONPATH=.
+export PYTHONPATH=packages/life-docai-analytics
 ```
 
 | Variable | Default | Purpose |
@@ -125,16 +144,15 @@ Every command accepts `--batch-id <batch_id>` (the default is set in
 `config.py`), `--seed` (split seed, default 13) and `--device cuda|cpu`.
 `--limit-stacks N` restricts a step to the first N stacks.
 
-`python -m antrag.classification.training.main --help` lists all steps; add a
-step name for its options, e.g. `... main train_stage1 --help`. If the package
-lives elsewhere, adjust the module prefix to its path from the repository root.
+`python -m life_docai_analytics_antrag.classification.training.main --help`
+lists all steps; add a step name for its options, e.g. `... main train_stage1 --help`.
 
 ## Running the pipeline
 
 Set a shortcut once:
 
 ```bash
-MAIN="python -m antrag.classification.training.main"
+MAIN="python -m life_docai_analytics_antrag.classification.training.main"
 ```
 
 Run the steps in this order. Each one checks its inputs and stops with a clear
@@ -147,7 +165,7 @@ $MAIN prepare --batch-id <batch_id>
 ```
 
 - **Reads:** page labels, document table, page inventory.
-- **Writes:** the page table in stack order, a population report, a list of excluded stacks with reasons, the stack split file, and a split report.
+- **Writes:** `stack_pages.csv` (pages in stack order with all targets), `stack_population_report.json`, `excluded_stacks.json` (reasons), `stack_splits.csv` and `stack_split_report.json`.
 - **Check:** in the population report, look at `stacks_excluded`, `primary_keys_resolved_by_fallback` and `first_page_labels_changed_vs_mapping`.
 
 Splits are made per stack (80/10/10 by default). Once assigned, a stack keeps
@@ -160,65 +178,91 @@ $MAIN compute_ocr --batch-id <batch_id> --workers 8                         # te
 $MAIN compute_visual_embeddings --batch-id <batch_id> --device cuda         # vision, fusion
 ```
 
-Both only process pages that are not cached yet, so they can be interrupted
-and resumed. The OCR cache is never deleted: an engine mismatch stops the run
-instead. For a quick smoke run, add `--training-limit-stacks N`, which covers
-N train stacks and N/4 validation stacks.
+Both only process pages that are not stored yet, so they can be interrupted
+and resumed.
+
+- **OCR text** goes to `ocr_text.jsonl`, one line per page. It is never deleted: an engine mismatch stops the run instead.
+- **CLIP vectors** go to `clip_features/`, as write-once shards of 4,096 pages plus `index.jsonl`. Adding pages never rewrites existing shards. Reading memory-maps them, so the full set is never loaded into RAM.
+
+For a quick smoke run, add `--training-limit-stacks N`, which covers N train
+stacks and N/4 validation stacks.
+
+**Existing single-file CLIP cache** (`{image_path: tensor}` in one `.pt`):
+convert it once instead of recomputing. The vectors stay identical, and the
+step can be repeated safely.
+
+```bash
+$MAIN migrate_clip_cache --batch-id <batch_id> --source <old_clip_cache.pt>
+```
 
 ### 3. Train Stage 1
 
 ```bash
 $MAIN train_stage1 --batch-id <batch_id> --modality fusion --epochs 5 \
-  --run-name <run_name> --device cuda [--balance-classes] [--lr-decay-epoch 3] [--use-bf16]
+  --run-name <run_name> --device cuda [--no-balance-classes] [--lr-decay-epoch 3] [--use-bf16]
 ```
 
 - `--modality vision|text|fusion` (see [Modalities](#modalities)).
-- `--balance-classes` draws pages with probability ∝ 1 / class frequency.
+- Class balancing is **on by default**: pages are drawn with probability ∝ 1 / class frequency. `--no-balance-classes` turns it off.
 - `--lr-decay-epoch E` lowers the learning rate to `--lr-decay-to` (default 2e-6) from epoch E on.
 - `--resume <checkpoint>` continues a run.
 
-It writes one checkpoint and one metrics file per epoch, plus a `best` checkpoint
-selected by validation macro-F1.
+Per epoch it writes `model_stage1_<modality>_<run>_epoch_NNN.pt` and
+`metrics_stage1_<modality>_<run>_epoch_NNN.json`, plus
+`model_stage1_<modality>_<run>_best_epoch_NNN.pt` whenever validation macro-F1
+improves.
 
 ### 4. Evaluate and inspect Stage 1 (optional)
 
 ```bash
-$MAIN evaluate_stage1 --checkpoint <stage1_best.pt> --split test --output <results>/stage1_test.json
-$MAIN predict_stage1  --checkpoint <stage1_best.pt> --output <results>/stage1_predictions.csv
+$MAIN evaluate_stage1 --checkpoint <stage1_best.pt> --split test --output <results>/evaluation_stage1_test.json
+$MAIN predict_stage1  --checkpoint <stage1_best.pt> --output <results>/predictions_stage1.csv
 ```
 
 ### 5. Extract Stage 2 features
 
 ```bash
-$MAIN precompute_features --stage1-checkpoint <stage1_best.pt> \
-  --output <classification output>/stage1_features_<run_name>.pt --device cuda
+$MAIN precompute_features --stage1-checkpoint <stage1_best.pt> --device cuda
 ```
 
-This loads the trained Stage 1 model, freezes it and saves one feature vector
-per page in stack order. The file records the hash of the checkpoint and of
-the population it was built from.
+This loads the trained Stage 1 model, freezes it and writes one feature row per
+page in stack order, to `stage1_features_<modality>_<checkpoint name>/`
+(`--output` sets another folder):
+
+- `features.npy`: the feature matrix, memory-mapped when read;
+- `pages.csv`: one row per page, with its row number and targets;
+- `metadata.json`: written last, with the hashes of the checkpoint, the population and `features.npy`.
+
+Each stack is one contiguous block of rows, so Stage 2 reads only the stacks
+of the current batch from disk.
 
 ### 6. Train Stage 2
 
 ```bash
-$MAIN train_stage2 --stage1-checkpoint <stage1_best.pt> --feature-cache <features.pt> \
-  --epochs 5 --run-name <run_name> --device cuda [--balance-classes]
+$MAIN train_stage2 --stage1-checkpoint <stage1_best.pt> --stage1-features <features dir> \
+  --epochs 5 --run-name <run_name> --device cuda [--no-balance-classes] [--max-pages-per-batch 2048]
 ```
 
-`--balance-classes` samples stacks by the rarest class they contain.
-`--resume <checkpoint>` continues a run.
+- Class balancing is **on by default**: stacks are sampled by the rarest class they contain. `--no-balance-classes` turns it off.
+- **Batches group stacks of similar length.** `--max-pages-per-batch` limits the padded size of a batch (stacks × longest stack, default 2,048), so a very long stack gets a batch of its own instead of padding the others. Predictions are not affected, because padding sits at the end of a unidirectional GRU.
+- `--resume <checkpoint>` continues a run.
+
+Checkpoints and metrics follow the Stage 1 pattern, with `final` for Stage 2:
+`model_final_<modality>_<run>_epoch_NNN.pt`, `…_best_epoch_NNN.pt` and
+`metrics_final_<modality>_<run>_epoch_NNN.json`.
 
 ### 7. Evaluate and predict with Stage 2
 
 ```bash
-$MAIN evaluate_stage2 --stage1-checkpoint <stage1_best.pt> --feature-cache <features.pt> \
-  --checkpoint <stage2_best.pt> --split test --output <results>/stage2_test.json
-$MAIN predict_stage2  --stage1-checkpoint <stage1_best.pt> --feature-cache <features.pt> \
-  --checkpoint <stage2_best.pt> --output <results>/stage2_predictions.csv
+$MAIN evaluate_stage2 --stage1-checkpoint <stage1_best.pt> --stage1-features <features dir> \
+  --checkpoint <final_best.pt> --split test --output <results>/evaluation_final_test.json
+$MAIN predict_stage2  --stage1-checkpoint <stage1_best.pt> --stage1-features <features dir> \
+  --checkpoint <final_best.pt> --output <results>/predictions_final.csv
 ```
 
-`--stage1-checkpoint` and `--feature-cache` must be the exact files used for
-training. Their hashes are checked.
+`--stage1-checkpoint` and `--stage1-features` must be the ones used for
+training. Their hashes are checked. Prediction rows are written in stack
+order.
 
 ### When to re-run what
 
@@ -233,13 +277,14 @@ training. Their hashes are checked.
 
 | File | Where | Contents |
 |---|---|---|
-| stack page table | classification output | one row per page: stack, position, image, targets, key source |
-| population report, excluded stacks, split report | classification output | counts and reasons |
-| stack split file | classification output | `stack_id → train/val/test`; reused by every run |
-| OCR cache, CLIP cache | classification output | keyed by `image_path`; shared across runs |
-| Stage 1 features | classification output | frozen page features + page metadata |
-| checkpoints | `…/checkpoints/` | `pnc_stage{1,2}_<run>_<modality>_epoch_NNN.pt` and `…_best_epoch_NNN.pt` |
-| per-epoch metrics | results | `pnc_stage{1,2}_<run>_<modality>_epoch_NNN.json` |
+| `stack_pages.csv` | classification output | one row per page: stack, position, image, targets, key source |
+| `stack_population_report.json`, `excluded_stacks.json`, `stack_split_report.json` | classification output | counts and reasons |
+| `stack_splits.csv` | classification output | `stack_id → train/val/test`; reused by every run |
+| `ocr_text.jsonl` | classification output | OCR text per page, keyed by `image_path` |
+| `clip_features/` | classification output | CLIP vector per page: shards + `index.jsonl` |
+| `stage1_features_<modality>_<checkpoint>/` | classification output | `features.npy`, `pages.csv`, `metadata.json` |
+| `model_stage1_…`, `model_final_…` | `…/checkpoints/` | `<modality>_<run>_epoch_NNN.pt` and `…_best_epoch_NNN.pt` |
+| `metrics_stage1_…`, `metrics_final_…` | results | per-epoch train and validation metrics |
 | evaluation / predictions | results | the paths given with `--output` |
 
 **Metrics.** Per-class precision, recall and F1; macro-F1 (over the classes
@@ -275,20 +320,23 @@ change its features.
 | Message | Cause and fix |
 |---|---|
 | `Refusing to overwrite existing file` / `Output already exists` | choose a new `--run-name` or `--output`, or delete the old file on purpose |
-| `Missing OCR text` / `Missing CLIP feature` | run step 2 for the same population |
+| `Missing OCR text` / `Missing CLIP feature(s)` | run step 2 for the same population |
 | `OCR cache … was built with …, but this environment selects …` | run in the environment with the original OCR engine; the cache is kept |
 | `Stage 1 checkpoint population is incompatible` | the population changed after Stage 1 was trained: retrain Stage 1 |
-| `Feature cache population is stale` / `… does not match feature cache` | rebuild features (step 5) with the right Stage 1 checkpoint |
-| `Incompatible Stage 1 checkpoint (needs a stack_v3 checkpoint)` | the checkpoint is from an older, non-stack pipeline: retrain |
+| `Stage 1 features were built for another population` / `… does not match the Stage 1 features` | rebuild the features (step 5) with the right Stage 1 checkpoint |
+| `Not a Stage 1 feature directory` | the folder is incomplete (no `metadata.json`) or from an older format: rebuild it |
+| `Incompatible Stage 1 checkpoint (needs a stack-level checkpoint)` | the checkpoint is from an older pipeline: retrain |
+| GPU out of memory in Stage 2 | lower `--max-pages-per-batch` |
 | `Validation/test need at least 10 TB0 stacks` | too few stacks of that class for the split; use more data or adjust the check in `data.py` |
-| `ModuleNotFoundError` | run from the repository root with `PYTHONPATH=.` inside the project environment |
+| `ModuleNotFoundError: life_docai_analytics_antrag` | run from the repository root with `PYTHONPATH=packages/life-docai-analytics`, or install the package in the environment |
 
 ## GwG labelling (optional)
 
 `gwg/` builds training labels for pages with an identification table, in two
 steps:
 
-1. `python -m antrag.classification.gwg.candidates --run-name <name>` ranks pages by table fields and other signals. It writes the LLM input, a hand-review sheet and a manifest.
-2. `python -m antrag.classification.gwg.llm_label --run-name <name> [--dry-run]` labels the selected pages with an LLM through an OpenAI-compatible endpoint, configured with `LLM_BASE_URL`, `LLM_API_KEY`, `LLM_MODEL` and `LLM_API_VERSION`. Use only an approved endpoint: the pages contain personal data.
+1. `python -m life_docai_analytics_antrag.classification.gwg.candidates --run-name <name>` ranks pages by table fields and other signals. It writes the LLM input, a hand-review sheet and a manifest.
+2. `python -m life_docai_analytics_antrag.classification.gwg.llm_label --run-name <name> [--dry-run]` labels the selected pages with an LLM through an OpenAI-compatible endpoint, configured with `LLM_BASE_URL`, `LLM_API_KEY`, `LLM_MODEL` and `LLM_API_VERSION`. Use only an approved endpoint: the pages contain personal data.
 
-Both scripts read the stack page table and the OCR cache from steps 1 and 2.
+Both scripts read `stack_pages.csv` and `ocr_text.jsonl` from steps 1 and 2
+(`--ocr-text` selects another OCR file).

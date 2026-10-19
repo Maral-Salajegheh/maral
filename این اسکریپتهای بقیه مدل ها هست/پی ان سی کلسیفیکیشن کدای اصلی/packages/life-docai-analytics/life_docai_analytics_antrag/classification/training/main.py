@@ -1,15 +1,16 @@
-"""Single entry point, as in PnC main.py. Run from life-docai with PYTHONPATH=.:
+"""Single entry point, as in PnC main.py. Run from the repository root (see README for PYTHONPATH):
 
-  python -m antrag.classification.training.main prepare
-  python -m antrag.classification.training.main compute_ocr
-  python -m antrag.classification.training.main compute_visual_embeddings --device cuda
-  python -m antrag.classification.training.main train_stage1 --modality fusion --run-name stack-v3
-  python -m antrag.classification.training.main evaluate_stage1 --checkpoint <stage1.pt> --output <json>
-  python -m antrag.classification.training.main predict_stage1 --checkpoint <stage1.pt> --output <csv>
-  python -m antrag.classification.training.main precompute_features --stage1-checkpoint <stage1.pt> --output <features.pt>
-  python -m antrag.classification.training.main train_stage2 --stage1-checkpoint <stage1.pt> --feature-cache <features.pt>
-  python -m antrag.classification.training.main evaluate_stage2 ... --checkpoint <stage2.pt> --output <json>
-  python -m antrag.classification.training.main predict_stage2  ... --checkpoint <stage2.pt> --output <csv>
+  python -m life_docai_analytics_antrag.classification.training.main prepare
+  python -m life_docai_analytics_antrag.classification.training.main compute_ocr
+  python -m life_docai_analytics_antrag.classification.training.main compute_visual_embeddings --device cuda
+  python -m life_docai_analytics_antrag.classification.training.main migrate_clip_cache --source <old single-file CLIP cache .pt>
+  python -m life_docai_analytics_antrag.classification.training.main train_stage1 --modality fusion --run-name <run_name>
+  python -m life_docai_analytics_antrag.classification.training.main evaluate_stage1 --checkpoint <stage1.pt> --output <json>
+  python -m life_docai_analytics_antrag.classification.training.main predict_stage1 --checkpoint <stage1.pt> --output <csv>
+  python -m life_docai_analytics_antrag.classification.training.main precompute_features --stage1-checkpoint <stage1.pt>
+  python -m life_docai_analytics_antrag.classification.training.main train_stage2 --stage1-checkpoint <stage1.pt> --stage1-features <dir>
+  python -m life_docai_analytics_antrag.classification.training.main evaluate_stage2 ... --checkpoint <stage2.pt> --output <json>
+  python -m life_docai_analytics_antrag.classification.training.main predict_stage2  ... --checkpoint <stage2.pt> --output <csv>
 """
 
 import argparse
@@ -55,11 +56,19 @@ def build_parser():
 
     def stage2_inputs(command):
         command.add_argument("--stage1-checkpoint", required=True)
-        command.add_argument("--feature-cache", required=True)
+        command.add_argument("--stage1-features", required=True, help="directory written by precompute_features")
+        command.add_argument("--max-pages-per-batch", type=int, default=2048,
+                             help="padded pages per batch; stacks of similar length are batched together")
+
+    def balance(command):
+        command.add_argument("--balance-classes", action=argparse.BooleanOptionalAction, default=True,
+                             help="on by default; --no-balance-classes turns it off")
 
     stage("prepare", device=False, limit=False)
     command = stage("compute_ocr", device=False); subset(command); command.add_argument("--workers", type=int)
     command = stage("compute_visual_embeddings", batch_size=32); subset(command)
+    command = stage("migrate_clip_cache", device=False, limit=False)
+    command.add_argument("--source", required=True, help="old single-file CLIP cache ({image_path: tensor})")
 
     command = stage("train_stage1", batch_size=8); precision(command)
     command.add_argument("--modality", choices=["vision", "text", "fusion"], required=True)
@@ -67,7 +76,7 @@ def build_parser():
     command.add_argument("--lr", type=float, default=1e-5)
     command.add_argument("--lr-decay-epoch", type=int, help="Epoch from which --lr-decay-to is used (PnC: 2e-6)")
     command.add_argument("--lr-decay-to", type=float, default=2e-6)
-    command.add_argument("--balance-classes", action="store_true")
+    balance(command)
     command.add_argument("--resume"); command.add_argument("--run-name")
     command = stage("evaluate_stage1", batch_size=8); precision(command)
     command.add_argument("--checkpoint", required=True)
@@ -77,18 +86,19 @@ def build_parser():
     command.add_argument("--checkpoint", required=True); command.add_argument("--output", required=True)
 
     command = stage("precompute_features", batch_size=8); subset(command)
-    command.add_argument("--stage1-checkpoint", required=True); command.add_argument("--output", required=True)
+    command.add_argument("--stage1-checkpoint", required=True)
+    command.add_argument("--output", help="default: stage1_features_<modality>_<checkpoint name> in the output folder")
 
-    command = stage("train_stage2", batch_size=4); stage2_inputs(command)
+    command = stage("train_stage2"); stage2_inputs(command)
     command.add_argument("--epochs", type=int, default=5)
     command.add_argument("--lr", type=float, default=1e-4)
-    command.add_argument("--balance-classes", action="store_true")
+    balance(command)
     command.add_argument("--resume"); command.add_argument("--run-name")
-    command = stage("evaluate_stage2", batch_size=4); stage2_inputs(command)
+    command = stage("evaluate_stage2"); stage2_inputs(command)
     command.add_argument("--checkpoint", required=True)
     command.add_argument("--split", choices=["train", "val", "test"], default="test")
     command.add_argument("--output", required=True)
-    command = stage("predict_stage2", batch_size=4); stage2_inputs(command)
+    command = stage("predict_stage2"); stage2_inputs(command)
     command.add_argument("--checkpoint", required=True); command.add_argument("--output", required=True)
     return parser
 
@@ -97,6 +107,7 @@ STAGES = {
     "prepare": prepare,
     "compute_ocr": workflows.compute_ocr,
     "compute_visual_embeddings": workflows.compute_visual_embeddings,
+    "migrate_clip_cache": workflows.migrate_clip_cache,
     "train_stage1": workflows.train_stage1,
     "evaluate_stage1": workflows.evaluate_stage1,
     "predict_stage1": workflows.predict_stage1,
