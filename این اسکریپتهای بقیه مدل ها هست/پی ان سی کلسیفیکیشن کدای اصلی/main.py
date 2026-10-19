@@ -1,153 +1,112 @@
+"""Single entry point, as in PnC main.py. Run from life-docai with PYTHONPATH=.:
+
+  python -m antrag.classification.training.main prepare
+  python -m antrag.classification.training.main compute_ocr
+  python -m antrag.classification.training.main compute_visual_embeddings --device cuda
+  python -m antrag.classification.training.main train_stage1 --modality fusion --run-name stack-v3
+  python -m antrag.classification.training.main evaluate_stage1 --checkpoint <stage1.pt> --output <json>
+  python -m antrag.classification.training.main predict_stage1 --checkpoint <stage1.pt> --output <csv>
+  python -m antrag.classification.training.main precompute_features --stage1-checkpoint <stage1.pt> --output <features.pt>
+  python -m antrag.classification.training.main train_stage2 --stage1-checkpoint <stage1.pt> --feature-cache <features.pt>
+  python -m antrag.classification.training.main evaluate_stage2 ... --checkpoint <stage2.pt> --output <json>
+  python -m antrag.classification.training.main predict_stage2  ... --checkpoint <stage2.pt> --output <csv>
+"""
+
 import argparse
-import os
+import json
 
-import data
-import evaluation
-import torch
-import workflows
-from config import BERT_MODEL_PATH
-from models import BertPageModel, SequenceModelRNN
+from . import workflows
+from .config import PipelineConfig
+from .data import prepare_model_population, split_assignments, split_report
+from .evaluation import write_json_new
 
 
-def parse_args():
-    parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--multimodal", action="store_true", help="Use multimodal model"
-    )
-    parser.add_argument(
-        "--text", action="store_true", help="Use text-only model (non-multimodal)"
-    )
-    parser.add_argument(
-        "--dataset", type=str, required=True, help="Dataset to use (claims or schaden)"
-    )
-    parser.add_argument(
-        "--stage",
-        type=str,
-        required=True,
-        help="Workflow to run (compute_visual_embeddings, train_stage1, train_stage2, evaluate_stage1, evalaute_stage2)",
-    )
-    parser.add_argument(
-        "--output_dir",
-        type=str,
-        default="outputs",
-        help="Output directory where model weights are saved",
-    )
-    parser.add_argument(
-        "--device",
-        type=str,
-        default="auto",
-        help="Device to use (cpu or cuda) - automatically inferred by default",
-    )
-    parser.add_argument(
-        "--batch_size", type=int, default=16, help="Batch size for model training"
-    )
-    parser.add_argument(
-        "--dummy_bert_features",
-        action="store_true",
-        help="Use only visual features for training sequence model (debug only)",
-    )
+def prepare(args):
+    config = PipelineConfig(batch_id=args.batch_id)
+    rows, population = prepare_model_population(config)
+    report = split_report(rows, split_assignments(config, rows, args.seed))
+    write_json_new(config.split_report, report)
+    print(json.dumps({"population": population, "splits": report, "model_pages": str(config.model_pages_csv),
+                      "excluded_stacks": str(config.excluded_stacks_report)}, indent=2))
 
-    args = parser.parse_args()
-    assert args.stage in [
-        "compute_visual_embeddings",
-        "train_stage1",
-        "train_stage2",
-        "evaluate_stage1",
-        "evaluate_stage2",
-    ], "Invalid stage specified"
-    if not args.multimodal and not args.text:
-        raise ValueError("One of --multimodal or --text must be specified")
-    if args.multimodal and args.text:
-        raise ValueError("Only one of --multimodal or --text can be specified")
-    return args
+
+def build_parser():
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = parser.add_subparsers(dest="stage", required=True)
+
+    def stage(name, *, device=True, batch_size=None, limit=True):
+        command = sub.add_parser(name)
+        command.add_argument("--batch-id", default=PipelineConfig.batch_id)
+        command.add_argument("--seed", type=int, default=13)
+        if device:
+            command.add_argument("--device")
+        if batch_size is not None:
+            command.add_argument("--batch-size", type=int, default=batch_size)
+        if limit:
+            command.add_argument("--limit-stacks", type=int)
+        return command
+
+    def subset(command):
+        command.add_argument("--training-limit-stacks", type=int, help="N train + N//4 val stacks (smoke runs)")
+
+    def precision(command):
+        command.add_argument("--use-fp16", action="store_true")
+        command.add_argument("--use-bf16", action="store_true")
+
+    def stage2_inputs(command):
+        command.add_argument("--stage1-checkpoint", required=True)
+        command.add_argument("--feature-cache", required=True)
+
+    stage("prepare", device=False, limit=False)
+    command = stage("compute_ocr", device=False); subset(command); command.add_argument("--workers", type=int)
+    command = stage("compute_visual_embeddings", batch_size=32); subset(command)
+
+    command = stage("train_stage1", batch_size=8); precision(command)
+    command.add_argument("--modality", choices=["vision", "text", "fusion"], required=True)
+    command.add_argument("--epochs", type=int, default=5)
+    command.add_argument("--lr", type=float, default=1e-5)
+    command.add_argument("--lr-decay-epoch", type=int, help="Epoch from which --lr-decay-to is used (PnC: 2e-6)")
+    command.add_argument("--lr-decay-to", type=float, default=2e-6)
+    command.add_argument("--balance-classes", action="store_true")
+    command.add_argument("--resume"); command.add_argument("--run-name")
+    command = stage("evaluate_stage1", batch_size=8); precision(command)
+    command.add_argument("--checkpoint", required=True)
+    command.add_argument("--split", choices=["train", "val", "test"], default="test")
+    command.add_argument("--output", required=True)
+    command = stage("predict_stage1", batch_size=8)
+    command.add_argument("--checkpoint", required=True); command.add_argument("--output", required=True)
+
+    command = stage("precompute_features", batch_size=8); subset(command)
+    command.add_argument("--stage1-checkpoint", required=True); command.add_argument("--output", required=True)
+
+    command = stage("train_stage2", batch_size=4); stage2_inputs(command)
+    command.add_argument("--epochs", type=int, default=5)
+    command.add_argument("--lr", type=float, default=1e-4)
+    command.add_argument("--balance-classes", action="store_true")
+    command.add_argument("--resume"); command.add_argument("--run-name")
+    command = stage("evaluate_stage2", batch_size=4); stage2_inputs(command)
+    command.add_argument("--checkpoint", required=True)
+    command.add_argument("--split", choices=["train", "val", "test"], default="test")
+    command.add_argument("--output", required=True)
+    command = stage("predict_stage2", batch_size=4); stage2_inputs(command)
+    command.add_argument("--checkpoint", required=True); command.add_argument("--output", required=True)
+    return parser
+
+
+STAGES = {
+    "prepare": prepare,
+    "compute_ocr": workflows.compute_ocr,
+    "compute_visual_embeddings": workflows.compute_visual_embeddings,
+    "train_stage1": workflows.train_stage1,
+    "evaluate_stage1": workflows.evaluate_stage1,
+    "predict_stage1": workflows.predict_stage1,
+    "precompute_features": workflows.precompute_features,
+    "train_stage2": workflows.train_stage2,
+    "evaluate_stage2": workflows.evaluate_stage2,
+    "predict_stage2": workflows.predict_stage2,
+}
 
 
 if __name__ == "__main__":
-    args = parse_args()
-
-    if args.device == "auto":
-        if torch.cuda.is_available():
-            print("GPU available")
-            args.device = "cuda"
-        else:
-            print("GPU not available")
-            args.device = "cpu"
-    print("Using device", args.device)
-
-    dataset, id_to_class, class_to_id, id_remapper_names, id_remapper = (
-        data.prepare_dataset()
-    )
-
-    if args.stage == "compute_visual_embeddings":
-        workflows.compute_visual_embeddings(dataset, args)
-    else:
-        if args.multimodal:
-            dataset = workflows.load_visual_embeddings(dataset, args)
-        dataset = data.build_validation_set(dataset)
-
-        bert_model = BertPageModel(
-            BERT_MODEL_PATH, multimodal=args.multimodal, num_classes=len(id_to_class)
-        ).to(args.device)
-        if args.stage in ["train_stage2", "evaluate_stage1", "evaluate_stage2"]:
-            # Load pretrained
-            if args.multimodal:
-                model_file_stage1 = f"model_{args.dataset}_stage1_multimodal.pth"
-            else:
-                model_file_stage1 = f"model_{args.dataset}_stage1_textonly.pth"
-            model_file_stage1 = os.path.join(args.output_dir, model_file_stage1)
-            bert_model.load_state_dict(
-                torch.load(model_file_stage1, map_location="cpu")["bert_model"]
-            )
-            print("Loaded Stage 1 weights")
-            bert_model.requires_grad_(False).eval()
-        model = None
-
-        prefetched_features = None
-        if args.stage == "train_stage1":
-            workflows.train_stage1(bert_model, dataset, args)
-        elif args.stage == "train_stage2":
-            # Instantiate sequence model
-            model = SequenceModelRNN(
-                multimodal=args.multimodal, num_classes=len(id_to_class)
-            ).to(args.device)
-            prefetched_features = workflows.precompute_bert_features(
-                bert_model, dataset, args
-            )
-            workflows.train_stage2(
-                bert_model, model, prefetched_features, dataset, args
-            )
-
-        # Evaluation
-        if args.stage in ["train_stage1", "evaluate_stage1"]:
-            bert_model.requires_grad_(False).eval()
-            results = evaluation.evaluate_stage1(bert_model, dataset, args)
-            evaluation.generate_report(
-                dataset, id_remapper, id_remapper_names, *results
-            )
-
-        elif args.stage in ["train_stage2", "evaluate_stage2"]:
-            if model is None:
-                # Instantiate sequence model
-                model = SequenceModelRNN(
-                    multimodal=args.multimodal, num_classes=len(id_to_class)
-                ).to(args.device)
-                if args.multimodal:
-                    model_file_stage2 = f"model_{args.dataset}_final_multimodal.pth"
-                else:
-                    model_file_stage2 = f"model_{args.dataset}_final_textonly.pth"
-                model_file_stage2 = os.path.join(args.output_dir, model_file_stage2)
-                model.load_state_dict(
-                    torch.load(model_file_stage2, map_location="cpu")["model"]
-                )
-                print("Loaded Stage 2 weights")
-            model.requires_grad_(False).eval()
-            if prefetched_features is None:
-                prefetched_features = workflows.precompute_bert_features(
-                    bert_model, dataset, args, no_train=True
-                )
-            results = evaluation.evaluate_stage2(
-                model, prefetched_features, dataset, args
-            )
-            evaluation.generate_report(
-                dataset, id_remapper, id_remapper_names, *results
-            )
+    args = build_parser().parse_args()
+    STAGES[args.stage](args)

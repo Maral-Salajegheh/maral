@@ -1,394 +1,331 @@
-import os
+"""Stack-level Life dataset (PnC sequence unit): one sequence per stack_id, pages in image_id order.
 
-import numpy as np
-import pandas as pd
-import torch
-from pnc_claims_classification.training.config import (
-    SCHADEN_DATASET_SUFFIX,
-    SHARED_FOLDER_ROOT_DIR,
-)
+image_id is the raw position of a page in the incoming stack before segmentation. masterindex_id and
+pdf_page_number are used only to find the rendered image of a page, never to order pages.
 
-default_data_file = f"usecases/docai/classifile/meta/schaden_202324/schaden_202324_page_level_meta_file_renamed_{SCHADEN_DATASET_SUFFIX}_mapped.parquet"
+Document boundaries come from the document key, compared between consecutive raw pages:
+  primary:  stack_id + doc_id + sfdoc_class
+  fallback: stack_id + masterindex_id + process_id + doc_id + subdoc_idx + sfdoc_class
+The fallback is used only for a primary key that is ambiguous (it covers several fallback keys),
+incomplete (an empty field) or anomalous (its pages are not one contiguous run in raw order).
+"""
 
+import csv
+import hashlib
+import json
+import random
+from collections import Counter, defaultdict
+from pathlib import Path
 
-def prepare_dataset(
-    data_file: str = default_data_file,
-    id_to_class: dict[int, str] | None = None,
-) -> tuple[
-    dict[str, dict[str, np.typing.NDArray]],
-    dict[int, str],
-    dict[str, int],
-    dict[int, str],
-    np.typing.NDArray,
-]:
-    """
-    Prepare dataset for training by loading data and creating class mappings.
-    This function loads a parquet dataset, adds mappings between class IDs and class names,
-    and prepares the training data structure. It handles class enumeration automatically
-    if no explicit mapping is provided.
-    Args:
-        data_file (str, optional): Path to the data file relative to SHARED_FOLDER_ROOT_DIR.
-            Defaults to default_data_file.
-        id_to_class (dict[int, str] | None, optional): Mapping from class IDs to class names.
-            If None, classes will be automatically enumerated from sorted unique target values.
-            Defaults to None.
-    Returns:
-        tuple: A 5-element tuple containing:
-            - dataset (dict[str, dict[str, np.typing.NDArray]]): Dictionary with 'train' key
-              containing the loaded training data
-            - id_to_class (dict[int, str]): Mapping from class IDs to class names
-            - class_to_id (dict[str, int]): Mapping from class names to class IDs
-            - id_remapper_names (dict[int, str]): Copy of id_to_class mapping for remapping
-            - id_remapper (np.typing.NDArray): Array for ID remapping operations
-    Note:
-        The function expects the parquet file to have a 'target' column containing
-        the class labels.
-    """
+import pyarrow.parquet as pq
 
-    meta = pd.read_parquet(os.path.join(SHARED_FOLDER_ROOT_DIR, data_file))
+from .config import CLASS_TO_ID, PipelineConfig
 
-    print(f"Loaded dataframe with {len(meta)} rows")
-
-    if not id_to_class:
-        id_to_class = {
-            id: cls for id, cls in enumerate(sorted(meta.target.unique().tolist()))
-        }
-
-    class_to_id = {cls: id for id, cls in id_to_class.items()}
-
-    id_remapper = np.arange(len(id_to_class))
-
-    # Free up memory
-    del meta
-
-    print("Dataset with ", len(id_to_class), "classes")
-
-    id_remapper_names = id_to_class
-
-    dataset = {
-        "train": load_data(
-            "train",
-            data_file,
-            class_to_id,
-        ),
-    }
-
-    return dataset, id_to_class, class_to_id, id_remapper_names, id_remapper
+IGNORE_INDEX = -100
+PRIMARY_KEY = ("stack_id", "doc_id", "sfdoc_class")
+FALLBACK_KEY = ("stack_id", "masterindex_id", "process_id", "doc_id", "subdoc_idx", "sfdoc_class")
+MODEL_FIELDS = [
+    "page_identity", "stack_id", "stack_position", "image_id", "masterindex_id", "pdf_page_number",
+    "image_path", "image_sha256", "has_label", "page_class", "class_target",
+    "is_first_page", "segmentation_target", "is_last_page", "last_page_target", "document_key_source",
+    "process_id", "doc_id", "subdoc_idx", "sfdoc_class", "label_tier", "training_label_quality",
+]
 
 
-def build_validation_set(
-    dataset: dict[str, dict[str, np.typing.NDArray]], split_ratio: float = 0.9
-) -> dict[str, dict[str, np.typing.NDArray]]:
-    """
-    Build a validation set by splitting the training data.
-    Takes the existing training data and splits it into new training and validation sets
-    based on the specified split ratio. The split is performed at the stack level using
-    a fixed random seed for reproducibility.
-    Args:
-        dataset: Dictionary containing dataset splits with 'train' key containing
-                training data arrays including stacks, features, text, classes, etc.
-        split_ratio: Float between 0 and 1 indicating the proportion of data to keep
-                    for training. Default is 0.9 (90% train, 10% validation).
-    Returns:
-        Dictionary with the same structure as input but with updated 'train' split
-        and new 'val' split. The original training data is split between these two.
-    Note:
-        - Uses a fixed random seed (5) for reproducible splits
-        - Splits are performed at the stack level to maintain data integrity
-        - Both new splits are flattened after creation
-        - Validates that total number of pages is preserved after split
-    """
+# ---------------------------------------------------------------------------
+# CSV helpers and splits
+# ---------------------------------------------------------------------------
 
-    print("Building validation set from training set...")
-    train_split = dataset["train"]
-    new_train_split = {}
-    val_split = {}
+def read_csv(path: Path):
+    with Path(path).open(newline="", encoding="utf-8-sig") as handle:
+        return list(csv.DictReader(handle))
 
-    rng = np.random.RandomState(5)
-    stacks_perm = rng.permutation(len(train_split["stacks"]))
-    print("Using split ratio", split_ratio)
-    split = int(split_ratio * len(stacks_perm))
-    stacks_train = sorted(stacks_perm[:split])
-    stacks_val = sorted(stacks_perm[split:])
 
-    for k in [
-        "stacks",
-        "stacks_isfirstpage",
-        "stacks_islastpage",
-        "stacks_pagenum_beg",
-        "stacks_pagenum_end",
-        "stacks_features",
-        "stacks_text",
-        "stacks_classes",
-    ]:
-        if k not in train_split:
+def write_csv(path: Path, rows, fields):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields)
+        writer.writeheader()
+        writer.writerows({field: row.get(field, "") for field in fields} for row in rows)
+
+
+def _write_new(path, rows, fields):
+    if path.exists():
+        raise FileExistsError(f"Refusing to overwrite existing file: {path}")
+    write_csv(path, rows, fields)
+
+
+def assign_splits(rows, split_file: Path, seed=13, train_ratio=0.8, val_ratio=0.1):
+    """Leakage-safe split by stack. Existing assignments are kept, also for stacks not in rows."""
+    existing = {row["stack_id"]: row["split"] for row in read_csv(split_file)} if split_file.exists() else {}
+    stack_rows = defaultdict(list)
+    for row in rows:
+        stack_rows[row["stack_id"]].append(row)
+    assignments = {stack: split for stack, split in existing.items() if stack in stack_rows}
+    new_stacks = [stack for stack in stack_rows if stack not in assignments]
+    rng = random.Random(seed); rng.shuffle(new_stacks)
+    targets = {"train": train_ratio, "val": val_ratio, "test": 1 - train_ratio - val_ratio}
+    counts = Counter(assignments.values())
+    for stack in new_stacks:
+        split = min(targets, key=lambda name: counts[name] / max(targets[name], 1e-9))
+        assignments[stack] = split; counts[split] += 1
+    tb0 = Counter(assignments[stack] for stack, pages in stack_rows.items() if any(r["page_class"] == "TB0" for r in pages))
+    if tb0["val"] < 10 or tb0["test"] < 10:
+        raise ValueError(f"Validation/test need at least 10 TB0 stacks: {dict(tb0)}")
+    if new_stacks:
+        merged = {**existing, **assignments}
+        tmp = split_file.with_suffix(".csv.tmp")
+        write_csv(tmp, [{"stack_id": stack, "split": merged[stack]} for stack in sorted(merged)], ["stack_id", "split"])
+        tmp.replace(split_file)
+    return assignments
+
+
+def split_assignments(config: PipelineConfig, rows, seed=13):
+    return assign_splits(rows, config.split_file, seed=seed)
+
+
+# ---------------------------------------------------------------------------
+# Stack population
+# ---------------------------------------------------------------------------
+
+def _true(value):
+    return str(value).strip().lower() == "true"
+
+
+def population_hash(rows):
+    digest = hashlib.sha256()
+    for row in sorted(rows, key=lambda item: (item["stack_id"], int(item["stack_position"]))):
+        digest.update(f'{row["page_identity"]}|{row["stack_id"]}|{row["stack_position"]}|{row["class_target"]}|{row["segmentation_target"]}\n'.encode())
+    return digest.hexdigest()
+
+
+def resolve_document_keys(pages):
+    """Document key per page of one stack (pages already in raw order)."""
+    primary = [tuple(str(p.get(f, "")).strip() for f in PRIMARY_KEY) for p in pages]
+    fallback = [tuple(str(p.get(f, "")).strip() for f in FALLBACK_KEY) for p in pages]
+    fallbacks_of, positions = defaultdict(set), defaultdict(list)
+    for index, (pk, fk) in enumerate(zip(primary, fallback)):
+        fallbacks_of[pk].add(fk); positions[pk].append(index)
+    ambiguous = {pk for pk, fks in fallbacks_of.items() if len(fks) > 1}
+    incomplete = {pk for pk in positions if any(part == "" for part in pk)}
+    non_contiguous = {pk for pk, pos in positions.items() if pos != list(range(pos[0], pos[-1] + 1))}
+    use_fallback = ambiguous | incomplete | non_contiguous
+    keys = [fk if pk in use_fallback else pk for pk, fk in zip(primary, fallback)]
+    sources = ["fallback" if pk in use_fallback else "primary" for pk in primary]
+    stats = {"ambiguous": len(ambiguous), "incomplete": len(incomplete - ambiguous),
+             "non_contiguous": len(non_contiguous - ambiguous - incomplete)}
+    return keys, sources, stats
+
+
+def _incomplete_stacks(documents, mid_to_stack):
+    """Stacks with at least one mapped document that is not usable (its pages are missing)."""
+    incomplete = set()
+    for doc in documents:
+        if _true(doc.get("is_usable")):
             continue
-        val_split[k] = train_split[k][stacks_val]
-        new_train_split[k] = train_split[k][stacks_train]
-
-    val_split = flatten_stacks(val_split)
-    new_train_split = flatten_stacks(new_train_split)
-
-    dataset["val"] = val_split
-    dataset["train"] = new_train_split
-
-    # Check consistency
-    assert len(dataset["train"]["pages_stacks"]) + len(
-        dataset["val"]["pages_stacks"]
-    ) == len(train_split["pages_stacks"])
-
-    print(
-        "Train/val stacks:",
-        len(dataset["train"]["stacks"]),
-        len(dataset["val"]["stacks"]),
-    )
-    return dataset
+        if doc.get("stack_id"):
+            incomplete.add(doc["stack_id"].lower())
+        stack = mid_to_stack.get(doc.get("masterindex_id"))
+        if stack:
+            incomplete.add(stack.lower())
+    return incomplete
 
 
-def flatten_stacks(
-    stacks_dict: dict[str, np.typing.NDArray],
-) -> dict[str, np.typing.NDArray]:
-    """
-    Flatten nested stacks of documents and pages into different representations.
-    Takes a dictionary containing stacks of documents (where each document contains pages)
-    and creates flattened versions with different levels of granularity.
-    Args:
-        stacks_dict (dict[str, np.typing.NDArray]): Dictionary where keys are stack names
-            and values are arrays of stacks. Each stack contains documents, and each
-            document contains pages.
-    Returns:
-        dict[str, np.typing.NDArray]: Updated dictionary with original data plus new keys:
-            - "flattened_{k}": Flattened stacks where each stack becomes a single list of pages
-            - "docs_{k}": All documents from all stacks concatenated into one array
-            - "pages_{k}": All pages from all documents concatenated, with concatenation
-              method depending on data type (torch.cat for tensors, np.concatenate otherwise)
-    Note:
-        The function modifies the input dictionary in-place and returns it.
-        Handles different data types appropriately:
-        - torch.Tensor: Uses torch.cat for concatenation
-        - String arrays: Uses np.concatenate with object dtype
-        - Other numeric arrays: Uses standard np.concatenate
-    """
+def build_stack_population(config: PipelineConfig):
+    labels = read_csv(config.pages_csv)
+    documents = read_csv(config.documents_csv)
+    inventory = pq.read_table(
+        config.page_inventory,
+        columns=["masterindex_id", "source_page_number", "image_path", "image_sha256", "status"],
+    ).to_pylist()
 
-    for k, stacks in list(stacks_dict.items()):
-        flattened = []
-        docs = []
-        for stack in stacks:
-            docs += stack
-            current_stack_pages = []
-            for doc in stack:
-                current_stack_pages += doc
-            flattened.append(current_stack_pages)
-        stacks_dict[f"flattened_{k}"] = np.array(flattened, dtype=object)
-        stacks_dict[f"docs_{k}"] = np.array(docs, dtype=object)
+    image_at = {}
+    rendered_per_mid = Counter()
+    for image in inventory:
+        if image.get("status") == "success":
+            image_at[(str(image["masterindex_id"]), int(image["source_page_number"]))] = image
+            rendered_per_mid[str(image["masterindex_id"])] += 1
 
-        if isinstance(docs[0], torch.Tensor):
-            stacks_dict[f"pages_{k}"] = torch.cat(docs, dim=0)
-        elif isinstance(docs[0][0], str):
-            stacks_dict[f"pages_{k}"] = np.concatenate(docs, axis=0, dtype=object)
-        else:
-            stacks_dict[f"pages_{k}"] = np.concatenate(docs, axis=0)
+    by_stack = defaultdict(list)
+    mid_to_stack = {}
+    for row in labels:
+        by_stack[row["stack_id"]].append(row)
+        mid_to_stack[row["masterindex_id"]] = row["stack_id"]
+    incomplete = _incomplete_stacks(documents, mid_to_stack)
 
-    return stacks_dict
+    rows, excluded = [], []
+    key_stats, boundary_changes = Counter(), 0
+    for stack_id, pages in sorted(by_stack.items()):
+        reason = None
+        if stack_id.lower() in incomplete:
+            reason = "stack_has_unusable_document"
+        elif any(not str(r.get("image_id", "")).strip().isdigit() for r in pages):
+            reason = "non_numeric_image_id"
+        if reason is None:
+            pages = sorted(pages, key=lambda r: int(r["image_id"]))  # raw order
+            if len({r["image_id"] for r in pages}) != len(pages):
+                reason = "duplicate_image_id"
+        images = []
+        if reason is None:
+            for r in pages:
+                position = str(r.get("pdf_page_number", "")).strip()
+                images.append(image_at.get((r["masterindex_id"], int(position))) if position.isdigit() else None)
+            if any(image is None for image in images):
+                reason = "image_missing"
+            elif len({image["image_path"] for image in images}) != len(images):
+                reason = "image_used_twice"
+        if reason is not None:
+            excluded.append({"stack_id": stack_id, "reason": reason, "pages": len(pages)})
+            continue
 
+        keys, sources, stats = resolve_document_keys(pages)
+        key_stats.update(stats)
+        for pos, (label, image) in enumerate(zip(pages, images)):
+            first = pos == 0 or keys[pos] != keys[pos - 1]                  # boundary in raw order
+            last = pos == len(pages) - 1 or keys[pos] != keys[pos + 1]
+            boundary_changes += first != _true(label["is_first_page"])
+            rows.append({
+                "page_identity": str(image["image_path"]),
+                "stack_id": stack_id,
+                "stack_position": str(pos + 1),
+                "image_id": label["image_id"],
+                "masterindex_id": label["masterindex_id"],
+                "pdf_page_number": label["pdf_page_number"],
+                "image_path": str(image["image_path"]),
+                "image_sha256": image.get("image_sha256") or "",
+                "has_label": "True",
+                "page_class": label["page_class"],
+                "class_target": str(CLASS_TO_ID[label["page_class"]]),
+                "is_first_page": str(first),
+                "segmentation_target": str(int(first)),
+                "is_last_page": str(last),
+                "last_page_target": str(int(last)),
+                "document_key_source": sources[pos],
+                "process_id": label["process_id"],
+                "doc_id": label["doc_id"],
+                "subdoc_idx": label["subdoc_idx"],
+                "sfdoc_class": label["sfdoc_class"],
+                "label_tier": label["label_tier"],
+                "training_label_quality": label["training_label_quality"],
+            })
 
-def load_data(
-    split: str,
-    data_file: str,
-    class_to_id: dict[str, int],
-) -> dict[str, np.typing.NDArray]:
-    """
-    Load and preprocess data from a parquet file for document classification.
-    This function loads document metadata from a parquet file, processes it to create
-    document boundaries and page information, filters by valid classes, and returns
-    a flattened dataset structure.
-    Args:
-        split: The data split identifier (e.g., 'train', 'val', 'test')
-        data_file (str): Path to the parquet file containing the data
-        class_to_id (dict[str, int]): Mapping of class names to integer IDs for filtering
-    Returns:
-        The flattened dataset output containing processed document stacks
-    Notes:
-        - Creates document IDs based on cumulative sum of first page flags
-        - Adds last page indicators and merges page count statistics
-        - Filters data to only include valid classes defined in class_to_id
-        - Sorts data by stack_id and image_id before processing
-        - Prints warnings if records are dropped due to invalid classes
-    """
-
-    meta = pd.read_parquet(os.path.join(SHARED_FOLDER_ROOT_DIR, data_file))
-    meta["split"] = split
-    meta["doc_id"] = meta["doc_first_page"].cumsum().apply(str)
-    lastpage_col = meta["doc_first_page"].values[1:].tolist()
-    lastpage_col.append(True)  # type: ignore[union-attr, arg-type]
-    meta["act_lastpage"] = lastpage_col
-
-    meta["sfdoc_class"] = meta["target"]
-    del meta["target"]
-
-    meta["act_firstpage"] = meta["doc_first_page"]
-    if split == "train":
-        assert meta["act_firstpage"].sum() == meta["act_lastpage"].sum(), (
-            meta["act_firstpage"].sum(),
-            meta["act_lastpage"].sum(),
-        )
-    counts = meta.groupby("stack_id")["doc_id"].count()
-    counts.name = "total_n_pages"
-    meta = meta.merge(counts, left_on="stack_id", right_index=True)
-
-    pre_len = len(meta)
-    meta = meta[meta.sfdoc_class.isin(class_to_id.keys())]
-    post_len = len(meta)
-    if pre_len != post_len:
-        print(
-            f"Warning in split {split}: dropped records ({pre_len} -> {post_len}) due to invalid classes"
-        )
-
-    meta_sorted = meta.sort_values(["stack_id", "image_id"])
-
-    stacks_dict = create_stacks_dict(
-        meta_sorted=meta_sorted,
-        split=split,
-        class_to_id=class_to_id,
-    )
-
-    output = flatten_stacks(stacks_dict)
-
-    print("Loaded", split)
-    return output
-
-
-def create_stacks_dict(
-    meta_sorted: pd.DataFrame,
-    split: str,
-    class_to_id: dict[str, int],
-) -> dict[str, np.typing.NDArray]:
-    """Create a dictionary containing organized data structures for model
-    training/evaluation.
-
-    This function processes a sorted metadata DataFrame and organizes the data into stacks,
-    where each stack contains multiple documents, and each document contains multiple pages.
-    The function tracks first page and last page labels, text content, and document classes.
-
-    Args:
-        meta_sorted (pd.DataFrame): Sorted DataFrame containing metadata with columns:
-            - doc_id: Document identifier
-            - stack_id: Stack identifier grouping related documents
-            - act_firstpage: Boolean indicating if this is the first page of a document
-            - act_lastpage: Boolean indicating if this is the last page of a document
-            - filename: Path to the document file
-            - text: Text content of the page
-            - sfdoc_class: Document classification label
-        split (str): Split type identifier. When "eval", ensures each document has at least
-            one first page by overriding flags if necessary.
-        class_to_id (dict[str, int]): Mapping from class names to class IDs.
-
-    Returns:
-        dict[str, np.typing.NDArray]: Dictionary containing organized data with keys:
-            - "stacks": Array of stacks, where each stack contains documents (lists of file paths)
-            - "stacks_isfirstpage": Array of first page labels for each page in each document
-            - "stacks_islastpage": Array of last page labels for each page in each document
-            - "stacks_text": Array of text content for each page in each document
-            - "stacks_classes": Array of class IDs for each page in each document
-
-    Note:
-        - Documents are grouped by stack_id and doc_id
-        - For evaluation splits, first page flags may be automatically corrected
-        - Unknown classes are assigned ID -100
-        - File paths are adjusted for documents starting with "doc" prefix
-    """
-
-    stacks = []
-    labels_firstpage = []
-    labels_lastpage = []
-    texts = []
-    classes = []
-    current_stack = None
-    current_labels_firstpage_stack = None
-    current_labels_lastpage_stack = None
-    current_text_stack = None
-    current_class_stack = None
-    current_doc = None
-    current_labels_firstpage_doc = None
-    current_labels_lastpage_doc = None
-    current_text_doc = None
-    current_class_doc = None
-    current_stack_id = None
-    current_doc_id = None  # For verification purposes
-    cnt_overridden = 0
-    for _, row in meta_sorted.iterrows():
-        if (
-            current_doc_id != row["doc_id"]
-            and split == "eval"
-            and not row["act_firstpage"]
-        ):
-            cnt_overridden += 1
-            row["act_firstpage"] = True
-        if row["act_firstpage"]:
-            if current_doc is not None and len(current_doc) > 0:
-                current_stack.append(current_doc)
-                current_labels_firstpage_stack.append(current_labels_firstpage_doc)
-                current_labels_lastpage_stack.append(current_labels_lastpage_doc)
-                current_text_stack.append(current_text_doc)
-                current_class_stack.append(current_class_doc)
-            current_doc = []
-            current_labels_firstpage_doc = []
-            current_labels_lastpage_doc = []
-            current_text_doc = []
-            current_class_doc = []
-            assert current_doc_id != row["doc_id"]
-            current_doc_id = row["doc_id"]
-        else:
-            assert current_doc_id == row["doc_id"]
-        if current_stack_id != row["stack_id"]:
-            if current_stack is not None and len(current_stack) > 0:
-                stacks.append(current_stack)
-                labels_firstpage.append(current_labels_firstpage_stack)
-                labels_lastpage.append(current_labels_lastpage_stack)
-                texts.append(current_text_stack)
-                classes.append(current_class_stack)
-            current_stack = []
-            current_labels_firstpage_stack = []
-            current_labels_lastpage_stack = []
-            current_text_stack = []
-            current_class_stack = []
-        current_stack_id = row["stack_id"]
-        path = (
-            row["filename"]
-            if not row["filename"].startswith("doc")
-            else "/tmp/s3/ap-mlops-pnc-claims-docai/" + row["filename"]  # nosec
-        )
-        current_doc.append(path)
-        current_labels_firstpage_doc.append(1 if row["act_firstpage"] else 0)
-        current_labels_lastpage_doc.append(1 if row["act_lastpage"] else 0)
-        current_text_doc.append(row["text"].strip())
-        current_class_doc.append(
-            class_to_id[row["sfdoc_class"]]
-            if row["sfdoc_class"] in class_to_id
-            else -100
-        )
-    if current_doc is not None and len(current_doc) > 0:
-        current_stack.append(current_doc)
-        current_labels_firstpage_stack.append(current_labels_firstpage_doc)
-        current_labels_lastpage_stack.append(current_labels_lastpage_doc)
-        current_text_stack.append(current_text_doc)
-        current_class_stack.append(current_class_doc)
-    if len(current_stack) > 0:
-        stacks.append(current_stack)
-        labels_firstpage.append(current_labels_firstpage_stack)
-        labels_lastpage.append(current_labels_lastpage_stack)
-        texts.append(current_text_stack)
-        classes.append(current_class_stack)
-
-    if cnt_overridden != 0:
-        print("Some firstpage flags were realigned. Count =", cnt_overridden)
-
-    stacks_dict = {
-        "stacks": np.array(stacks, dtype=object),
-        "stacks_isfirstpage": np.array(labels_firstpage, dtype=object),
-        "stacks_islastpage": np.array(labels_lastpage, dtype=object),
-        "stacks_text": np.array(texts, dtype=object),
-        "stacks_classes": np.array(classes, dtype=object),
+    used_mids = Counter(row["masterindex_id"] for row in rows)
+    report = {
+        "analyse_db_rows": len(labels),
+        "stacks_total": len(by_stack),
+        "stacks_used": len({row["stack_id"] for row in rows}),
+        "stacks_excluded": dict(Counter(e["reason"] for e in excluded)),
+        "pages_used": len(rows),
+        "pages_excluded": sum(e["pages"] for e in excluded),
+        "page_class_counts": dict(Counter(row["page_class"] for row in rows)),
+        "documents": sum(int(row["segmentation_target"]) for row in rows),
+        "primary_keys_resolved_by_fallback": dict(key_stats),
+        "pages_on_fallback_key": sum(row["document_key_source"] == "fallback" for row in rows),
+        "first_page_labels_changed_vs_mapping": boundary_changes,
+        "rendered_pages_without_row_in_used_mids": sum(rendered_per_mid[m] - used_mids[m] for m in used_mids),
+        "population_hash": population_hash(rows),
     }
+    return rows, excluded, report
 
-    return stacks_dict
+
+def prepare_model_population(config: PipelineConfig):
+    for path in (config.model_pages_csv, config.population_report, config.excluded_stacks_report):
+        if path.exists():
+            raise FileExistsError(f"Refusing to overwrite existing file: {path}")
+    rows, excluded, report = build_stack_population(config)
+    if not rows:
+        raise RuntimeError(f"No usable stacks: {json.dumps(report, indent=2)}")
+    config.classification_output.mkdir(parents=True, exist_ok=True)
+    _write_new(config.model_pages_csv, rows, MODEL_FIELDS)
+    config.excluded_stacks_report.write_text(json.dumps(excluded, indent=2), encoding="utf-8")
+    config.population_report.write_text(json.dumps(report, indent=2, sort_keys=True), encoding="utf-8")
+    return rows, report
+
+
+# ---------------------------------------------------------------------------
+# Loading and selecting stacks
+# ---------------------------------------------------------------------------
+
+def validate_complete_stacks(rows):
+    by_stack = defaultdict(list)
+    for row in rows:
+        by_stack[row["stack_id"]].append(row)
+    errors = []
+    for stack_id, stack_rows in by_stack.items():
+        ordered = sorted(stack_rows, key=lambda row: int(row["stack_position"]))
+        if [int(row["stack_position"]) for row in ordered] != list(range(1, len(ordered) + 1)):
+            errors.append({"stack_id": stack_id, "reason": "nonconsecutive_stack_positions"})
+        image_ids = [int(row["image_id"]) for row in ordered]
+        if image_ids != sorted(set(image_ids)):
+            errors.append({"stack_id": stack_id, "reason": "positions_not_in_image_id_order"})
+        if len({row["page_identity"] for row in ordered}) != len(ordered):
+            errors.append({"stack_id": stack_id, "reason": "duplicate_page_identity"})
+    if errors:
+        raise ValueError(f"Invalid stack sequences: {errors[:10]}")
+    return by_stack
+
+
+def load_model_pages(config: PipelineConfig):
+    rows = read_csv(config.model_pages_csv)
+    validate_complete_stacks(rows)
+    return rows
+
+
+def select_complete_stacks(rows, limit_stacks=None):
+    by_stack = validate_complete_stacks(rows)
+    selected = sorted(by_stack)
+    if limit_stacks is not None:
+        selected = selected[:limit_stacks]
+    return [row for stack in selected for row in sorted(by_stack[stack], key=lambda item: int(item["stack_position"]))]
+
+
+def rows_for_split(rows, assignments, split, limit_stacks=None):
+    return select_complete_stacks([row for row in rows if assignments[row["stack_id"]] == split], limit_stacks)
+
+
+def training_subset(config, rows, limit_stacks=None, training_limit_stacks=None, seed=13):
+    """All stacks, the first N stacks, or N train stacks + N//4 val stacks (smoke runs)."""
+    if limit_stacks and training_limit_stacks:
+        raise ValueError("Choose limit_stacks or training_limit_stacks")
+    if not training_limit_stacks:
+        return select_complete_stacks(rows, limit_stacks)
+    assignments = split_assignments(config, rows, seed)
+    return (rows_for_split(rows, assignments, "train", training_limit_stacks)
+            + rows_for_split(rows, assignments, "val", max(1, training_limit_stacks // 4)))
+
+
+def build_stack_sequences(pages):
+    by_stack = defaultdict(list)
+    for page in pages:
+        by_stack[page["stack_id"]].append(page)
+    sequences = []
+    for stack_id, stack_pages in sorted(by_stack.items()):
+        ordered = sorted(stack_pages, key=lambda page: int(page["stack_position"]))
+        if [int(page["stack_position"]) for page in ordered] != list(range(1, len(ordered) + 1)):
+            raise ValueError(f"Stack {stack_id} has invalid positions")
+        sequences.append(ordered)
+    return sequences
+
+
+def split_report(rows, assignments):
+    by_split = defaultdict(list)
+    for row in rows:
+        by_split[assignments[row["stack_id"]]].append(row)
+    report = {}
+    for split, split_rows in by_split.items():
+        stacks = defaultdict(list)
+        for row in split_rows:
+            stacks[row["stack_id"]].append(row)
+        report[split] = {
+            "stacks": len(stacks),
+            "pages": len(split_rows),
+            "single_page_stacks": sum(len(v) == 1 for v in stacks.values()),
+            "documents": sum(int(row["segmentation_target"]) for row in split_rows),
+            "internal_first_page_positives": sum(
+                int(row["segmentation_target"]) for row in split_rows if row["stack_position"] != "1"),
+            "page_class_counts": dict(Counter(row["page_class"] for row in split_rows)),
+        }
+    stacks = {split: {row["stack_id"] for row in split_rows} for split, split_rows in by_split.items()}
+    pairs = [("train", "val"), ("train", "test"), ("val", "test")]
+    report["stack_overlap"] = sum(len(stacks.get(a, set()) & stacks.get(b, set())) for a, b in pairs)
+    return report

@@ -1,71 +1,81 @@
-import numpy as np
+"""PnC Stage 1 page model and Stage 2 sequence model."""
+
 import torch
 import torch.nn as nn
-from transformers import AutoConfig, AutoModel, AutoTokenizer, BertModel
+from transformers import BertModel, BertTokenizer
 
 
-class BertPageModel(nn.Module):
-    """
-    First stage of the pipeline: a BERT model that takes a single page as input (text + optional visual embedding)
-    and predicts (1) whether it is a first page, (2) whether it is a last page, and (3) its class.
-    After training, the model is used as a feature extractor (without the classification heads) for the sequence model.
-    The model is trained starting from the GBERT weights.
-    """
+class PageClassifier(nn.Module):
+    """PnC page model with Life modality adaptation."""
 
     def __init__(
         self,
-        bert_model_path: str,
-        multimodal: bool,
-        num_classes: int,
-        pretrained: bool = True,
-        clip_input_dim: int = 1024,
-        lr: float = 1e-5,
-        betas: tuple[float, float] = (0.9, 0.99),
-        weight_decay: float = 0.01,
+        text_model_name,
+        num_classes,
+        modality="fusion",
+        pretrained=True,
+        clip_input_dim=1024,
+        lr=1e-5,
+        betas=(0.9, 0.99),
+        weight_decay=0.01,
     ):
         super().__init__()
-        self.multimodal = multimodal
-        if pretrained:
-            self.encoder = BertModel.from_pretrained(
-                bert_model_path, add_pooling_layer=False
-            )
-        else:
-            config = AutoConfig.from_pretrained(bert_model_path)
-            self.encoder = AutoModel.from_config(config, add_pooling_layer=False)
-
-        if multimodal:
-            self.p1_encoder = nn.Linear(clip_input_dim, 1024)
-        self.out_seg = nn.Linear(1024, 2)  # First-page predictor
-        self.out_lastpage = nn.Linear(1024, 2)  # Last-page predictor
-        self.out_class = nn.Linear(1024, num_classes)
-        if multimodal:
+        if modality not in {"vision", "text", "fusion"}:
+            raise ValueError(f"Unsupported modality: {modality}")
+        self.modality = modality
+        self.multimodal = modality == "fusion"
+        self.embedding_dim = 1024
+        self.encoder = None
+        self.tokenizer = None
+        if modality in {"text", "fusion"}:
+            if not pretrained:
+                raise ValueError("The corrected port requires pretrained PnC GBERT initialization")
+            self.encoder = BertModel.from_pretrained(text_model_name, add_pooling_layer=False)
+            self.tokenizer = BertTokenizer.from_pretrained(text_model_name)
+        if self.multimodal:
+            self.p1_encoder = nn.Linear(clip_input_dim, self.embedding_dim)
             self.dropout = nn.Dropout(0.1)
-        self.tokenizer = AutoTokenizer.from_pretrained(bert_model_path)
-
+        self.out_seg = nn.Linear(self.embedding_dim, 2)
+        self.out_lastpage = nn.Linear(self.embedding_dim, 2)
+        self.out_class = nn.Linear(self.embedding_dim, num_classes)
         self.lr = lr
         self.betas = betas
         self.weight_decay = weight_decay
 
-    def forward(self, visual_embedding, batch, return_embeddings=False, **kwargs):
+    def forward(
+        self,
+        visual_embedding=None,
+        batch=None,
+        return_embeddings=False,
+        **kwargs,
+    ):
         if batch is None:
-            assert len(kwargs) > 0
             batch = kwargs
+        elif kwargs:
+            raise ValueError("Pass either batch or keyword tensors, not both")
+        if self.modality == "vision":
+            if visual_embedding is None:
+                raise ValueError("Vision modality requires visual_embedding")
+            h = visual_embedding.float()
         else:
-            assert len(kwargs) == 0
-        if self.multimodal:
-            # Add visual embedding to [CLS] token embedding
-            embs = self.encoder.embeddings.word_embeddings(batch["input_ids"])
             if self.multimodal:
-                embs[:, 0] += self.dropout(self.p1_encoder(visual_embedding))
-            del batch["input_ids"]
-            batch["inputs_embeds"] = embs
-        h = self.encoder(**batch)[0][:, 0]  # First token of last layer ([CLS])
+                if visual_embedding is None:
+                    raise ValueError("Fusion modality requires visual_embedding")
+                embeddings = self.encoder.embeddings.word_embeddings(batch["input_ids"])
+                embeddings[:, 0] += self.dropout(self.p1_encoder(visual_embedding.float()))
+                encoded = self.encoder(
+                    inputs_embeds=embeddings,
+                    attention_mask=batch.get("attention_mask"),
+                    token_type_ids=batch.get("token_type_ids"),
+                )
+            else:
+                encoded = self.encoder(**batch)
+            h = encoded[0][:, 0]
+        if h.shape[-1] != self.embedding_dim:
+            raise ValueError(f"Expected {self.embedding_dim}-D page representation, got {h.shape[-1]}")
         if return_embeddings:
             return h
-        seg = self.out_seg(h)
-        lp = self.out_lastpage(h)
-        cl = self.out_class(h)
-        return (seg, cl, lp)
+        return self.out_seg(h), self.out_class(h), self.out_lastpage(h)
 
     def get_optimizer(self):
         return torch.optim.AdamW(
@@ -79,23 +89,24 @@ class BertPageModel(nn.Module):
 class SequenceModelRNN(nn.Module):
     def __init__(
         self,
-        multimodal: bool,
-        num_classes: int,
-        bert_input_dim: int = 1024,
-        clip_input_dim: int = 1024,
-        lr: float = 0.0001,
+        multimodal,
+        num_classes,
+        bert_input_dim=1024,
+        clip_input_dim=1024,
+        lr=1e-4,
+        input_dim=None,
     ):
         super().__init__()
-
         hidden_dim = 1024
-        self.input_dim = bert_input_dim
+        self.input_dim = input_dim or (bert_input_dim + (clip_input_dim if multimodal else 0))
         self.multimodal = multimodal
-        if multimodal:
-            self.input_dim += clip_input_dim
         self.encoder = nn.GRU(
-            self.input_dim, hidden_dim, num_layers=2, batch_first=True, dropout=0.1
+            self.input_dim,
+            hidden_dim,
+            num_layers=2,
+            batch_first=True,
+            dropout=0.1,
         )
-
         self.out_seg = nn.Linear(hidden_dim, 2)
         self.out_class = nn.Linear(hidden_dim, num_classes)
         self.dropout = nn.Dropout(0.1)
@@ -104,33 +115,7 @@ class SequenceModelRNN(nn.Module):
     def forward(self, x):
         x = self.dropout(x)
         x, _ = self.encoder(x)
-
-        x_seg = self.out_seg(x)
-        x_class = self.out_class(x)
-        return (x_seg, x_class)
+        return self.out_seg(x), self.out_class(x)
 
     def get_optimizer(self):
         return torch.optim.Adam(self.parameters(), lr=self.lr)
-
-
-class ShuffledSampler:
-    """Infinite cyclic data sampler."""
-
-    def __init__(self, size):
-        self.ptr = 0
-        self.size = size
-        self.shuffled_indices = None
-
-    def _yield_batch(self, batch_size):
-        for _ in range(batch_size):
-            if self.shuffled_indices is None:
-                self.shuffled_indices = np.random.permutation(self.size)
-            next_elem = self.shuffled_indices[self.ptr]
-            self.ptr += 1
-            if self.ptr == self.size:
-                self.ptr = 0
-                self.shuffled_indices = None
-            yield next_elem
-
-    def __call__(self, batch_size):
-        return list(self._yield_batch(batch_size))
