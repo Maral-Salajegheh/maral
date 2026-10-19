@@ -23,9 +23,13 @@ RESULTS_DIR = "results"
 
 @dataclass(frozen=True)
 class PipelineConfig:
-    batch_id: str = "life_20260918_A00_G07_MAD_6000_sample_MID"
+    batch_id: str          # required: every run names its batch explicitly
     # package root: packages/life-docai-analytics/life_docai_analytics_antrag/ (this file is classification/training/config.py)
     root: Path = Path(__file__).resolve().parents[2]
+
+    def __post_init__(self):
+        if not self.batch_id or not self.batch_id.strip():
+            raise ValueError("batch_id is required")
 
     # ---- upstream inputs -------------------------------------------------
     @property

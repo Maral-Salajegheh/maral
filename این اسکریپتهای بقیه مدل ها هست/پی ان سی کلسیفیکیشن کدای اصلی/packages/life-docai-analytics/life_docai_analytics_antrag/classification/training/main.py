@@ -81,9 +81,10 @@ def build_parser():
     command = stage("evaluate_stage1", batch_size=8); precision(command)
     command.add_argument("--checkpoint", required=True)
     command.add_argument("--split", choices=["train", "val", "test"], default="test")
-    command.add_argument("--output", required=True)
+    command.add_argument("--output", help="optional; defaults to the batch results folder")
     command = stage("predict_stage1", batch_size=8)
-    command.add_argument("--checkpoint", required=True); command.add_argument("--output", required=True)
+    command.add_argument("--checkpoint", required=True)
+    command.add_argument("--output", help="optional; defaults to the batch results folder")
 
     command = stage("precompute_features", batch_size=8); subset(command)
     command.add_argument("--stage1-checkpoint", required=True)
@@ -97,9 +98,10 @@ def build_parser():
     command = stage("evaluate_stage2"); stage2_inputs(command)
     command.add_argument("--checkpoint", required=True)
     command.add_argument("--split", choices=["train", "val", "test"], default="test")
-    command.add_argument("--output", required=True)
+    command.add_argument("--output", help="optional; defaults to the batch results folder")
     command = stage("predict_stage2"); stage2_inputs(command)
-    command.add_argument("--checkpoint", required=True); command.add_argument("--output", required=True)
+    command.add_argument("--checkpoint", required=True)
+    command.add_argument("--output", help="optional; defaults to the batch results folder")
     return parser
 
 

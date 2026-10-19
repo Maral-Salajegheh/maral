@@ -49,6 +49,18 @@ def _check_new(*paths):
             raise FileExistsError(f"Output already exists: {path}; use another --run-name or --output")
 
 
+def _result_output(args, config, kind, stage, suffix, split=None):
+    """Use an explicit output path or create a stable name from the checkpoint."""
+    if args.output:
+        return Path(args.output)
+    checkpoint = Path(args.checkpoint).stem
+    parts = [kind, stage]
+    if split:
+        parts.append(split)
+    parts.append(checkpoint)
+    return config.results_dir / ("_".join(parts) + suffix)
+
+
 # ===========================================================================
 # Page caches (OCR text, CLIP vectors), keyed by image_path
 # ===========================================================================
@@ -305,8 +317,9 @@ def evaluate_stage1(args):
     model, payload = load_stage1_checkpoint(args.checkpoint, device)
     modality = payload["metadata"]["modality"]
     loader, _ = _stage1_loader(selected, model, modality, args.batch_size, False, False, *load_inputs(config, modality))
-    write_json_new(Path(args.output), stage1_epoch(model, loader, None, device, args.use_fp16, args.use_bf16))
-    print(args.output)
+    output = _result_output(args, config, "evaluation", "stage1", ".json", args.split)
+    write_json_new(output, stage1_epoch(model, loader, None, device, args.use_fp16, args.use_bf16))
+    print(output)
 
 
 def predict_stage1(args):
@@ -333,8 +346,9 @@ def predict_stage1(args):
                 output.append(record)
     if not output:
         raise ValueError("No pages to predict")
-    write_csv_new(Path(args.output), output, list(output[0]))
-    print(args.output)
+    output_path = _result_output(args, config, "predictions", "stage1", ".csv")
+    write_csv_new(output_path, output, list(output[0]))
+    print(output_path)
 
 
 # ===========================================================================
@@ -616,8 +630,9 @@ def evaluate_stage2(args):
         raise ValueError(f"The Stage 1 features hold no stacks of split {args.split}")
     model, _ = load_stage2_checkpoint(args, store, device)
     loader, _ = _stage2_loader(sequences, store, args.max_pages_per_batch, False, False)
-    write_json_new(Path(args.output), stage2_epoch(model, loader, None, device))
-    print(args.output)
+    output = _result_output(args, config, "evaluation", "final", ".json", args.split)
+    write_json_new(output, stage2_epoch(model, loader, None, device))
+    print(output)
 
 
 def predict_stage2(args):
@@ -645,5 +660,6 @@ def predict_stage2(args):
     if not output:
         raise ValueError("No pages to predict")
     output.sort(key=lambda r: (r["stack_id"], int(r["stack_position"])))   # batches are grouped by length
-    write_csv_new(Path(args.output), output, list(output[0]))
-    print(args.output)
+    output_path = _result_output(args, config, "predictions", "final", ".csv")
+    write_csv_new(output_path, output, list(output[0]))
+    print(output_path)
