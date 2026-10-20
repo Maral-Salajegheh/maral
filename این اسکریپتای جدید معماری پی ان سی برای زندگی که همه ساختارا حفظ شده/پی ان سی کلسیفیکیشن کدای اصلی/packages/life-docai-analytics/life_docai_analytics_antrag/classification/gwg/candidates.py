@@ -242,7 +242,7 @@ def write_csv(path, rows, fields):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--batch-id", default=PipelineConfig.batch_id)
+    parser.add_argument("--batch-id", required=True)
     parser.add_argument("--run-name", required=True)
     parser.add_argument("--threshold", type=int, default=6, help="Score from which every page goes to the LLM")
     parser.add_argument("--random-below", type=int, default=300, help="Random pages below the threshold (recall check)")

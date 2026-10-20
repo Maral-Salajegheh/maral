@@ -228,11 +228,23 @@ def build_stack_population(config: PipelineConfig):
     return rows, excluded, report
 
 
-def prepare_model_population(config: PipelineConfig):
+def _file_record(path):
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return {"path": str(Path(path).resolve()), "size_bytes": Path(path).stat().st_size, "sha256": digest.hexdigest()}
+
+
+def prepare_model_population(config: PipelineConfig, seed=13):
     for path in (config.model_pages_csv, config.population_report, config.excluded_stacks_report):
         if path.exists():
             raise FileExistsError(f"Refusing to overwrite existing file: {path}")
     rows, excluded, report = build_stack_population(config)
+    report["batch_id"] = config.batch_id
+    report["split_seed"] = seed
+    report["inputs"] = {name: _file_record(path) for name, path in
+                        [("pages", config.pages_csv), ("documents", config.documents_csv), ("page_inventory", config.page_inventory)]}
     if not rows:
         raise RuntimeError(f"No usable stacks: {json.dumps(report, indent=2)}")
     config.classification_output.mkdir(parents=True, exist_ok=True)

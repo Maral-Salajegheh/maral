@@ -24,7 +24,7 @@ from .evaluation import write_json_new
 
 def prepare(args):
     config = PipelineConfig(batch_id=args.batch_id)
-    rows, population = prepare_model_population(config)
+    rows, population = prepare_model_population(config, args.seed)
     report = split_report(rows, split_assignments(config, rows, args.seed))
     write_json_new(config.split_report, report)
     print(json.dumps({"population": population, "splits": report, "model_pages": str(config.model_pages_csv),
@@ -37,7 +37,7 @@ def build_parser():
 
     def stage(name, *, device=True, batch_size=None, limit=True):
         command = sub.add_parser(name)
-        command.add_argument("--batch-id", default=PipelineConfig.batch_id)
+        command.add_argument("--batch-id", required=True)
         command.add_argument("--seed", type=int, default=13)
         if device:
             command.add_argument("--device")

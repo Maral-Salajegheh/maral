@@ -53,11 +53,10 @@ def _result_output(args, config, kind, stage, suffix, split=None):
     """Use an explicit output path or create a stable name from the checkpoint."""
     if args.output:
         return Path(args.output)
-    checkpoint = Path(args.checkpoint).stem
     parts = [kind, stage]
     if split:
         parts.append(split)
-    parts.append(checkpoint)
+    parts.append(Path(args.checkpoint).stem)
     return config.results_dir / ("_".join(parts) + suffix)
 
 

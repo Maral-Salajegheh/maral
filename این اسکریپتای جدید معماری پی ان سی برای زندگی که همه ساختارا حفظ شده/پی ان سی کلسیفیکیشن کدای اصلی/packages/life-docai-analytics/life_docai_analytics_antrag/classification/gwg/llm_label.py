@@ -210,7 +210,7 @@ def summarise(labels, inputs):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--batch-id", default=PipelineConfig.batch_id)
+    parser.add_argument("--batch-id", required=True)
     parser.add_argument("--run-name", required=True)
     parser.add_argument("--limit", type=int, help="Label at most N pending pages (try 20 first)")
     parser.add_argument("--text-only", action="store_true", help="Send OCR text without the page image")
