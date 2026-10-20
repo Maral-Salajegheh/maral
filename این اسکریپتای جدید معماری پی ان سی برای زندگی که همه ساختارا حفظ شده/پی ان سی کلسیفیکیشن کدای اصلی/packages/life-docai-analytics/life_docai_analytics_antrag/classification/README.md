@@ -144,3 +144,20 @@ python -m life_docai_analytics_antrag.classification.gwg.llm_label --batch-id <b
 
 The LLM endpoint is configured with environment variables. Use only an
 approved endpoint, because the pages contain personal data.
+
+
+
+## smoke test
+
+```bash
+PYTHONPATH=packages/life-docai-analytics pixi run -e dev python -m life_docai_analytics_antrag.classification.training.main train_stage1 --batch-id life_20260918_A00_G07_MAD_6000_sample_MID --modality vision --run-name smoke --limit-stacks 40 --epochs 1 --device cuda
+
+PYTHONPATH=packages/life-docai-analytics pixi run -e dev python -m life_docai_analytics_antrag.classification.training.main precompute_features --batch-id life_20260918_A00_G07_MAD_6000_sample_MID --stage1-checkpoint packages/life-docai-analytics/life_docai_analytics_antrag/classification/output/life_20260918_A00_G07_MAD_6000_sample_MID/checkpoints/model_stage1_vision_smoke_best_epoch_001.pt --training-limit-stacks 40 --device cuda
+
+PYTHONPATH=packages/life-docai-analytics pixi run -e dev python -m life_docai_analytics_antrag.classification.training.main train_stage2 --batch-id life_20260918_A00_G07_MAD_6000_sample_MID --stage1-checkpoint packages/life-docai-analytics/life_docai_analytics_antrag/classification/output/life_20260918_A00_G07_MAD_6000_sample_MID/checkpoints/model_stage1_vision_smoke_best_epoch_001.pt --stage1-features packages/life-docai-analytics/life_docai_analytics_antrag/classification/output/life_20260918_A00_G07_MAD_6000_sample_MID/stage1_features_vision_smoke --run-name smoke --limit-stacks 40 --epochs 1 --device cuda
+
+PYTHONPATH=packages/life-docai-analytics pixi run -e dev python -m life_docai_analytics_antrag.classification.training.main predict_stage2 --batch-id life_20260918_A00_G07_MAD_6000_sample_MID --stage1-checkpoint packages/life-docai-analytics/life_docai_analytics_antrag/classification/output/life_20260918_A00_G07_MAD_6000_sample_MID/checkpoints/model_stage1_vision_smoke_best_epoch_001.pt --stage1-features packages/life-docai-analytics/life_docai_analytics_antrag/classification/output/life_20260918_A00_G07_MAD_6000_sample_MID/stage1_features_vision_smoke --checkpoint packages/life-docai-analytics/life_docai_analytics_antrag/classification/output/life_20260918_A00_G07_MAD_6000_sample_MID/checkpoints/model_final_vision_smoke_best_epoch_001.pt --output packages/life-docai-analytics/life_docai_analytics_antrag/classification/results/life_20260918_A00_G07_MAD_6000_sample_MID/predictions_final_vision_smoke.csv
+
+
+python -m life_docai_analytics_antrag.classification.gwg.llm_label --batch-id <batch_id> --run-name <name>
+```
