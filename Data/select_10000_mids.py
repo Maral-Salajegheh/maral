@@ -138,3 +138,8 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
+
+
+powershell -ExecutionPolicy Bypass -File .\select_10000_mids.ps1
