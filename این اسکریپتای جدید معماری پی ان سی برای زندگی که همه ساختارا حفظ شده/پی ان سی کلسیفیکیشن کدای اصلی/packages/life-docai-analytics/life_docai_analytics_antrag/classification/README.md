@@ -71,38 +71,55 @@ processing/training commands and two optional evaluation commands.
 1. **Build the dataset**: groups the pages into stacks in their original order, sets the labels, and makes the train/validation/test split.
    ```bash
    PYTHONPATH=packages/life-docai-analytics pixi run -e dev python -m life_docai_analytics_antrag.classification.training.main prepare --batch-id <batch_id>
+
+   PYTHONPATH=packages/life-docai-analytics pixi run -e dev python -m life_docai_analytics_antrag.classification.training.main prepare --batch-id life_20260918_A00_G07_MAD_6000_sample_MID
    ```
 2. **OCR the pages**:
    ```bash
    PYTHONPATH=packages/life-docai-analytics pixi run -e dev python -m life_docai_analytics_antrag.classification.training.main compute_ocr --batch-id <batch_id> --workers 8
+   PYTHONPATH=packages/life-docai-analytics pixi run -e dev python -m life_docai_analytics_antrag.classification.training.main compute_ocr --batch-id life_20260918_A00_G07_MAD_6000_sample_MID --workers 7
    ```
 3. **Compute the image vectors** (needed for `fusion` and `vision`):
    ```bash
    PYTHONPATH=packages/life-docai-analytics pixi run -e dev python -m life_docai_analytics_antrag.classification.training.main compute_visual_embeddings --batch-id <batch_id> --device cuda
+   PYTHONPATH=packages/life-docai-analytics pixi run -e dev python -m life_docai_analytics_antrag.classification.training.main compute_visual_embeddings --batch-id life_20260918_A00_G07_MAD_6000_sample_MID --device cuda
+
    ```
 4. **Train Stage 1**:
    ```bash
    PYTHONPATH=packages/life-docai-analytics pixi run -e dev python -m life_docai_analytics_antrag.classification.training.main train_stage1 --batch-id <batch_id> --modality fusion --run-name <run_name> --device cuda
+
+   PYTHONPATH=packages/life-docai-analytics pixi run -e dev python -m life_docai_analytics_antrag.classification.training.main train_stage1 --batch-id life_20260918_A00_G07_MAD_6000_sample_MID --modality fusion --run-name stack --device cuda
    ```
 5. **Evaluate Stage 1** (optional):
    ```bash
    PYTHONPATH=packages/life-docai-analytics pixi run -e dev python -m life_docai_analytics_antrag.classification.training.main evaluate_stage1 --batch-id <batch_id> --checkpoint <stage1_checkpoint>
+
+   PYTHONPATH=packages/life-docai-analytics pixi run -e dev python -m life_docai_analytics_antrag.classification.training.main evaluate_stage1 --batch-id life_20260918_A00_G07_MAD_6000_sample_MID --checkpoint packages/life-docai-analytics/life_docai_analytics_antrag/classification/output/life_20260918_A00_G07_MAD_6000_sample_MID/checkpoints/model_stage1_fusion_stack_best_epoch_NNN.pt --output packages/life-docai-analytics/life_docai_analytics_antrag/classification/results/life_20260918_A00_G07_MAD_6000_sample_MID/evaluation_stage1_fusion_stack.json
    ```
 6. **Extract the page features for Stage 2**:
    ```bash
    PYTHONPATH=packages/life-docai-analytics pixi run -e dev python -m life_docai_analytics_antrag.classification.training.main precompute_features --batch-id <batch_id> --stage1-checkpoint <stage1_checkpoint> --device cuda
+
+   PYTHONPATH=packages/life-docai-analytics pixi run -e dev python -m life_docai_analytics_antrag.classification.training.main precompute_features --batch-id life_20260918_A00_G07_MAD_6000_sample_MID --stage1-checkpoint packages/life-docai-analytics/life_docai_analytics_antrag/classification/output/life_20260918_A00_G07_MAD_6000_sample_MID/checkpoints/model_stage1_fusion_stack_best_epoch_NNN.pt --device cuda
    ```
 7. **Train Stage 2**:
    ```bash
    PYTHONPATH=packages/life-docai-analytics pixi run -e dev python -m life_docai_analytics_antrag.classification.training.main train_stage2 --batch-id <batch_id> --stage1-checkpoint <stage1_checkpoint> --stage1-features <features_folder> --run-name <run_name> --device cuda
+
+   PYTHONPATH=packages/life-docai-analytics pixi run -e dev python -m life_docai_analytics_antrag.classification.training.main train_stage2 --batch-id life_20260918_A00_G07_MAD_6000_sample_MID --stage1-checkpoint packages/life-docai-analytics/life_docai_analytics_antrag/classification/output/life_20260918_A00_G07_MAD_6000_sample_MID/checkpoints/model_stage1_fusion_stack_best_epoch_NNN.pt --stage1-features packages/life-docai-analytics/life_docai_analytics_antrag/classification/output/life_20260918_A00_G07_MAD_6000_sample_MID/stage1_features_fusion_stack --run-name stack --device cuda
    ```
 8. **Evaluate Stage 2** (optional):
    ```bash
    PYTHONPATH=packages/life-docai-analytics pixi run -e dev python -m life_docai_analytics_antrag.classification.training.main evaluate_stage2 --batch-id <batch_id> --stage1-checkpoint <stage1_checkpoint> --stage1-features <features_folder> --checkpoint <stage2_checkpoint>
+
+   PYTHONPATH=packages/life-docai-analytics pixi run -e dev python -m life_docai_analytics_antrag.classification.training.main evaluate_stage2 --batch-id life_20260918_A00_G07_MAD_6000_sample_MID --stage1-checkpoint packages/life-docai-analytics/life_docai_analytics_antrag/classification/output/life_20260918_A00_G07_MAD_6000_sample_MID/checkpoints/model_stage1_fusion_stack_best_epoch_NNN.pt --stage1-features packages/life-docai-analytics/life_docai_analytics_antrag/classification/output/life_20260918_A00_G07_MAD_6000_sample_MID/stage1_features_fusion_stack --checkpoint packages/life-docai-analytics/life_docai_analytics_antrag/classification/output/life_20260918_A00_G07_MAD_6000_sample_MID/checkpoints/model_final_fusion_stack_best_epoch_MMM.pt --output packages/life-docai-analytics/life_docai_analytics_antrag/classification/results/life_20260918_A00_G07_MAD_6000_sample_MID/evaluation_final_fusion_stack.json
    ```
 9. **Run the final prediction**:
    ```bash
    PYTHONPATH=packages/life-docai-analytics pixi run -e dev python -m life_docai_analytics_antrag.classification.training.main predict_stage2 --batch-id <batch_id> --stage1-checkpoint <stage1_checkpoint> --stage1-features <features_folder> --checkpoint <stage2_checkpoint>
+
+   PYTHONPATH=packages/life-docai-analytics pixi run -e dev python -m life_docai_analytics_antrag.classification.training.main predict_stage2 --batch-id life_20260918_A00_G07_MAD_6000_sample_MID --stage1-checkpoint packages/life-docai-analytics/life_docai_analytics_antrag/classification/output/life_20260918_A00_G07_MAD_6000_sample_MID/checkpoints/model_stage1_fusion_stack_best_epoch_NNN.pt --stage1-features packages/life-docai-analytics/life_docai_analytics_antrag/classification/output/life_20260918_A00_G07_MAD_6000_sample_MID/stage1_features_fusion_stack --checkpoint packages/life-docai-analytics/life_docai_analytics_antrag/classification/output/life_20260918_A00_G07_MAD_6000_sample_MID/checkpoints/model_final_fusion_stack_best_epoch_MMM.pt --output packages/life-docai-analytics/life_docai_analytics_antrag/classification/results/life_20260918_A00_G07_MAD_6000_sample_MID/predictions_final_fusion_stack.csv
    ```
 
 Steps 2 and 3 skip pages that are already done, so they can be stopped and
