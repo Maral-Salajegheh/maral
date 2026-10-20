@@ -41,7 +41,7 @@ from life_docai.utils.snowflake_utils import get_engine
 
 DEFAULT_SCHEMA = "D131_D2D"
 MAPPING_FILE = Path(
-    "/home/shared_folders/life_ai/mid_mapping/sample_A00_G07_MAD_6000.txt"
+    "/home/shared_folders/life_ai/mid_mapping/Antrag_A00_G07_MAD.csv"
 )
 OUTPUT_DIR = Path(__file__).resolve().parent / "output"
 
