@@ -1,5 +1,12 @@
 """Orchestrator: run the ingestion stages for one batch, in order, stopping at
-the first failure. Writes run_summary.json locally and to S3.
+the first failure. Writes run_summary.json locally.
+
+After a successful run that includes stage 03, the local source.zip is deleted
+when all of the following hold (use --keep-zip to keep it):
+    - every row in page_inventory.parquet has status "success"
+    - the raw copy exists in S3 with exactly the same size as the local ZIP
+The manifests folder is kept. A deleted ZIP can be restored from the raw layer
+(the command is printed) if stage 02 or 03 must run again.
 
 Examples:
     # Step 1 (WITH tokens): download only, then stops and tells you to
@@ -17,15 +24,26 @@ import sys
 import time
 from pathlib import Path
 
+import boto3
+import pyarrow.parquet as pq
+from botocore.exceptions import BotoCoreError, ClientError
 
 from common import (
     atomic_write_json,
     build_batch_id,
+    get_s3_head,
     resolve_source_uri,
     utc_now_iso,
     validate_batch_id,
 )
-from config import LOCAL_TEMP_ROOT, SOURCE_ZIP_PREFIX
+from config import (
+    AWS_REGION,
+    LOCAL_OUTPUT_ROOT,
+    LOCAL_TEMP_ROOT,
+    PROJECT_BUCKET,
+    RAW_DATA_PREFIX,
+    SOURCE_ZIP_PREFIX,
+)
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 STAGES = [
@@ -56,6 +74,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--to-stage", choices=STAGE_NUMBERS, default=STAGE_NUMBERS[-1])
     parser.add_argument(
         "--extra-args-03", default="", help="Extra arguments for stage 03 (render)."
+    )
+    parser.add_argument(
+        "--keep-zip", action="store_true", help="Do not delete the local source.zip after a clean render."
     )
     return parser
 
@@ -112,6 +133,66 @@ def run_stage(number: str, script: str, args: argparse.Namespace) -> dict:
     }
 
 
+def count_unrendered_pages(batch_id: str) -> int | None:
+    """Page rows whose status is not "success"; None when the inventory is missing."""
+    path = LOCAL_OUTPUT_ROOT / batch_id / "page_inventory.parquet"
+    if not path.is_file():
+        return None
+    statuses = pq.read_table(path, columns=["status"]).column("status").to_pylist()
+    return sum(status != "success" for status in statuses)
+
+
+def cleanup_local_zip(batch_id: str) -> dict:
+    """Delete the local source.zip once the render is clean and S3 holds an identical-size copy."""
+    zip_path = LOCAL_TEMP_ROOT / batch_id / "input" / "source.zip"
+    raw_uri = f"s3://{PROJECT_BUCKET}/{RAW_DATA_PREFIX}/{batch_id}/source.zip"
+    result = {"zip_path": str(zip_path), "raw_copy": raw_uri, "deleted": False}
+
+    if not zip_path.is_file():
+        result["reason"] = "local ZIP not found"
+        return result
+
+    unrendered = count_unrendered_pages(batch_id)
+    if unrendered is None:
+        result["reason"] = "page_inventory.parquet not found"
+        return result
+    if unrendered:
+        result["reason"] = f"{unrendered} page rows are not 'success'"
+        return result
+
+    local_size = zip_path.stat().st_size
+    try:
+        s3_client = boto3.client("s3", region_name=AWS_REGION)
+        head = get_s3_head(s3_client, PROJECT_BUCKET, f"{RAW_DATA_PREFIX}/{batch_id}/source.zip")
+    except (ClientError, BotoCoreError) as error:
+        result["reason"] = f"S3 check failed: {error}"
+        return result
+    if head is None:
+        result["reason"] = "raw copy not found in S3"
+        return result
+    if int(head["ContentLength"]) != local_size:
+        result["reason"] = f"S3 size {head['ContentLength']} differs from local size {local_size}"
+        return result
+
+    zip_path.unlink()
+    try:
+        zip_path.parent.rmdir()  # remove input/ if it is now empty
+    except OSError:
+        pass
+    result.update({"deleted": True, "freed_bytes": local_size})
+    return result
+
+
+def print_cleanup(result: dict) -> None:
+    """Report what happened to the local ZIP."""
+    if result["deleted"]:
+        print(f"\nLocal ZIP deleted ({result['freed_bytes'] / 1024**3:.1f} GiB freed): {result['zip_path']}")
+        print("Restore it if stage 02 or 03 must run again:")
+        print(f"  aws s3 cp {result['raw_copy']} {result['zip_path']}")
+    else:
+        print(f"\nLocal ZIP kept ({result['reason']}): {result['zip_path']}")
+
+
 def main() -> None:
     """Run the selected stages and write the run summary."""
     args = build_parser().parse_args()
@@ -147,6 +228,11 @@ def main() -> None:
             atomic_write_json(summary_path, summary)
             print(f"\nRun summary: {summary_path}")
             sys.exit(0)
+
+    rendered = any(number == "03" for number, _ in selected)
+    if overall_success and rendered and not args.keep_zip:
+        summary["zip_cleanup"] = cleanup_local_zip(batch_id)
+        print_cleanup(summary["zip_cleanup"])
 
     summary["status"] = "success" if overall_success else "failed"
     summary["finished_at_utc"] = utc_now_iso()

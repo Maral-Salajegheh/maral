@@ -9,7 +9,7 @@ AWS_REGION = os.getenv("AWS_REGION", "eu-central-1")
 PROJECT_BUCKET = os.getenv("PROJECT_BUCKET", "ap-mlops-life-ai")
 # Only the raw ZIPs are kept in S3, under this prefix.
 RAW_DATA_PREFIX = os.getenv("RAW_DATA_PREFIX", "life_prod_raw_data").strip("/")
-LOCAL_TEMP_ROOT = Path(os.getenv("LOCAL_TEMP_ROOT", "/tmp/life-document-ai"))
+LOCAL_TEMP_ROOT = Path(os.getenv("LOCAL_TEMP_ROOT", "/home/shared_folders/life_ai/life-document-ai-temp"))
 # Manifests and rendered pages stay local, under the current working directory.
 LOCAL_OUTPUT_ROOT = Path(os.getenv("LOCAL_OUTPUT_ROOT", "output"))
 RENDER_ROOT = Path(os.getenv("RENDER_ROOT", "RenderedPages"))
