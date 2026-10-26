@@ -1,0 +1,2 @@
+#how to save credentials:
+nano ~/.aws/credentials

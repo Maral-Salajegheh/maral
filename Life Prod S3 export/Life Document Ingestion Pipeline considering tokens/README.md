@@ -26,7 +26,7 @@ stops after it and prints a reminder to remove the tokens before continuing.
 | 01 | `01_download_batch_zip.py` | Downloads the ZIP, checks size and CRC, computes SHA-256 | Local `source.zip` + `ingestion_manifest.json` |
 | 01b | `01b_register_raw_zip.py` | Uploads the ZIP and its manifest to the immutable raw layer | `s3://<PROJECT_BUCKET>/<RAW_DATA_PREFIX>/<batch_id>/` |
 | 02 | `02_build_document_inventory.py` | Scans the ZIP without extracting; one row per MasterIndex folder (its PDF and CSV), with page count and readability | Local `document_inventory.parquet` |
-| 03 | `03_render_pdf_pages.py` | Renders every PDF page to an image with adaptive zoom; resumes documents already rendered | Local `page_inventory.parquet` + page images |
+| 03 | `03_render_pdf_pages.py` | Renders every PDF page to an image with adaptive zoom, in parallel worker processes (`--workers`, default: CPU count - 1); each worker reads one PDF at a time from the ZIP; resumes documents already rendered | Local `page_inventory.parquet` + page images |
 
 Only the raw ZIP and `ingestion_manifest.json` are stored in S3. Inventories
 and images stay on the local server.
@@ -44,6 +44,9 @@ rm ~/.aws/credentials
 
 # Step 2 - WITHOUT tokens: register the raw ZIP, build inventory, render
 python run_pipeline.py --batch-id <batch_id> --from-stage 01b
+
+# Step 2 with a chosen number of render workers
+python run_pipeline.py --batch-id <batch_id> --from-stage 01b --extra-args-03 "--workers 64"
 ```
 
 `--source-s3-uri` accepts a bare filename (resolved against
@@ -53,18 +56,33 @@ The `batch_id` names one delivery; every path is derived from it. When
 omitted in step 1 it is built as `life_<YYYYMMDD>_<zip filename>` and printed.
 From stage 01b on it must be passed explicitly.
 
+### Parallel rendering
+
+Stage 03 renders documents in parallel. `--extra-args-03` is passed to stage 03
+whenever stage 03 is part of the run, so `--workers` can be set with any
+`--from-stage` (01b, 02 or 03). Without it, CPU count - 1 workers are used.
+
+Every worker holds one PDF and one rendered page in memory, and all workers
+write images to the same disk. On a shared server, start with a moderate
+number (for example 64) and check `free -h`; more workers stop helping once the
+disk is the bottleneck. The inventory keeps the document order of
+`document_inventory.parquet`, so the output does not depend on the worker count.
+
 ### Common variations
 
 ```bash
 # Re-run only rendering
 python run_pipeline.py --batch-id <batch_id> --from-stage 03
 
+# Re-run only rendering with a chosen number of workers
+python run_pipeline.py --batch-id <batch_id> --from-stage 03 --extra-args-03 "--workers 64"
+
 # A range of stages
 python run_pipeline.py --batch-id <batch_id> --from-stage 02 --to-stage 02
 
 # Options for stage 03 (higher DPI, force a full re-render)
 python run_pipeline.py --batch-id <batch_id> --from-stage 03 \
-  --extra-args-03 "--dpi 300 --no-resume"
+  --extra-args-03 "--dpi 300 --no-resume --workers 64"
 
 # Use a different staging location for the ZIP
 LOCAL_TEMP_ROOT=/home/shared_folders/life_ai/life-document-ai-temp \
@@ -77,7 +95,8 @@ aws s3 ls s3://ap-mlops-life-ai/life_prod_raw_data/
 
 Each stage can also be run on its own with `--batch-id <batch_id>`. Run
 directly, stage 01 needs a full `s3://` URI; stage 01b accepts
-`--overwrite-raw` to replace an existing raw ZIP.
+`--overwrite-raw` to replace an existing raw ZIP; stage 03 accepts
+`--workers N`.
 
 ## Where things are written
 
@@ -120,7 +139,7 @@ run_pipeline.py                  Orchestrator
 01_download_batch_zip.py         Stage 01  (needs tokens)
 01b_register_raw_zip.py          Stage 01b (no tokens)
 02_build_document_inventory.py   Stage 02
-03_render_pdf_pages.py           Stage 03
+03_render_pdf_pages.py           Stage 03  (parallel)
 ```
 
 ## Dependencies
