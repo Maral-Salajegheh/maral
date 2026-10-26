@@ -37,7 +37,7 @@ Run from this directory (output paths are relative to it).
 
 ```bash
 # Step 1 - WITH tokens: download only. Prints the derived batch_id.
-python run_pipeline.py --source-s3-uri Leben_2026_08_10.zip
+python run_pipeline.py --source-s3-uri <zip_filename>
 
 # Remove the tokens
 rm ~/.aws/credentials
@@ -49,8 +49,9 @@ python run_pipeline.py --batch-id <batch_id> --from-stage 01b
 python run_pipeline.py --batch-id <batch_id> --from-stage 01b --extra-args-03 "--workers 64"
 ```
 
-`--source-s3-uri` accepts a bare filename (resolved against
-`SOURCE_ZIP_PREFIX`) or a full `s3://` URI.
+`<zip_filename>` is the name of the ZIP in `SOURCE_ZIP_PREFIX`
+(`aws s3 ls s3://itecmcm-prod-prod-flexporter-life-prod/02_OUT/`).
+`--source-s3-uri` accepts that bare filename or a full `s3://` URI.
 
 The `batch_id` names one delivery; every path is derived from it. When
 omitted in step 1 it is built as `life_<YYYYMMDD>_<zip filename>` and printed.
@@ -68,6 +69,21 @@ number (for example 64) and check `free -h`; more workers stop helping once the
 disk is the bottleneck. The inventory keeps the document order of
 `document_inventory.parquet`, so the output does not depend on the worker count.
 
+### Local ZIP cleanup
+
+After a successful run that includes stage 03, the orchestrator deletes the
+local `source.zip` when every page in `page_inventory.parquet` has status
+`success` and the raw copy in S3 has the same size. Otherwise the ZIP is kept
+and the reason is printed. The result is recorded under `zip_cleanup` in
+`run_summary.json`. Pass `--keep-zip` to keep it.
+
+To run stage 02 or 03 again after the ZIP was deleted, restore it from the raw
+layer first (the command is printed after deletion):
+
+```bash
+aws s3 cp s3://<PROJECT_BUCKET>/<RAW_DATA_PREFIX>/<batch_id>/source.zip <LOCAL_TEMP_ROOT>/<batch_id>/input/source.zip
+```
+
 ### Common variations
 
 ```bash
@@ -77,6 +93,9 @@ python run_pipeline.py --batch-id <batch_id> --from-stage 03
 # Re-run only rendering with a chosen number of workers
 python run_pipeline.py --batch-id <batch_id> --from-stage 03 --extra-args-03 "--workers 64"
 
+# Keep the local ZIP after rendering
+python run_pipeline.py --batch-id <batch_id> --from-stage 03 --keep-zip
+
 # A range of stages
 python run_pipeline.py --batch-id <batch_id> --from-stage 02 --to-stage 02
 
@@ -85,8 +104,7 @@ python run_pipeline.py --batch-id <batch_id> --from-stage 03 \
   --extra-args-03 "--dpi 300 --no-resume --workers 64"
 
 # Use a different staging location for the ZIP
-LOCAL_TEMP_ROOT=/home/shared_folders/life_ai/life-document-ai-temp \
-  python run_pipeline.py --batch-id <batch_id> --from-stage 03
+LOCAL_TEMP_ROOT=<path> python run_pipeline.py --batch-id <batch_id> --from-stage 03
 
 # List available source ZIPs / registered raw batches
 aws s3 ls s3://itecmcm-prod-prod-flexporter-life-prod/02_OUT/
@@ -102,7 +120,7 @@ directly, stage 01 needs a full `s3://` URI; stage 01b accepts
 
 | What | Location |
 |------|----------|
-| Downloaded ZIP | `<LOCAL_TEMP_ROOT>/<batch_id>/input/source.zip` |
+| Downloaded ZIP (deleted after a clean render) | `<LOCAL_TEMP_ROOT>/<batch_id>/input/source.zip` |
 | `ingestion_manifest.json`, `run_summary.json` | `<LOCAL_TEMP_ROOT>/<batch_id>/manifests/` |
 | `document_inventory.parquet`, `page_inventory.parquet` | `<LOCAL_OUTPUT_ROOT>/<batch_id>/` |
 | Page images | `<RENDER_ROOT>/<batch_id>/<masterindex_id>/<render_version>/page_NNNN.png` |
@@ -120,7 +138,7 @@ All values in `config.py` can be overridden with environment variables.
 
 | Variable | Default | Meaning |
 |----------|---------|---------|
-| `LOCAL_TEMP_ROOT` | `/tmp/life-document-ai` | Staging for the ZIP and manifests |
+| `LOCAL_TEMP_ROOT` | `/home/shared_folders/life_ai/life-document-ai-temp` | Staging for the ZIP and manifests |
 | `LOCAL_OUTPUT_ROOT` | `output` | Inventories |
 | `RENDER_ROOT` | `RenderedPages` | Page images |
 | `SOURCE_ZIP_PREFIX` | `s3://itecmcm-prod-prod-flexporter-life-prod/02_OUT` | Where source ZIPs are looked up |
@@ -135,7 +153,7 @@ for the ZIP there.
 ```
 config.py                        Central configuration (env-overridable)
 common.py                        Shared utilities (IDs, hashing, Parquet, S3 helpers)
-run_pipeline.py                  Orchestrator
+run_pipeline.py                  Orchestrator (deletes the local ZIP after a clean render)
 01_download_batch_zip.py         Stage 01  (needs tokens)
 01b_register_raw_zip.py          Stage 01b (no tokens)
 02_build_document_inventory.py   Stage 02
