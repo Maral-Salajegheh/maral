@@ -1,18 +1,3 @@
-"""Single entry point, as in PnC main.py. Run from the repository root (see README for PYTHONPATH):
-
-  python -m life_docai_analytics_antrag.classification.training.main prepare
-  python -m life_docai_analytics_antrag.classification.training.main compute_ocr
-  python -m life_docai_analytics_antrag.classification.training.main compute_visual_embeddings --device cuda
-  python -m life_docai_analytics_antrag.classification.training.main migrate_clip_cache --source <old single-file CLIP cache .pt>
-  python -m life_docai_analytics_antrag.classification.training.main train_stage1 --modality fusion --run-name <run_name>
-  python -m life_docai_analytics_antrag.classification.training.main evaluate_stage1 --checkpoint <stage1.pt> --output <json>
-  python -m life_docai_analytics_antrag.classification.training.main predict_stage1 --checkpoint <stage1.pt> --output <csv>
-  python -m life_docai_analytics_antrag.classification.training.main precompute_features --stage1-checkpoint <stage1.pt>
-  python -m life_docai_analytics_antrag.classification.training.main train_stage2 --stage1-checkpoint <stage1.pt> --stage1-features <dir>
-  python -m life_docai_analytics_antrag.classification.training.main evaluate_stage2 ... --checkpoint <stage2.pt> --output <json>
-  python -m life_docai_analytics_antrag.classification.training.main predict_stage2  ... --checkpoint <stage2.pt> --output <csv>
-"""
-
 import argparse
 import json
 
@@ -20,6 +5,16 @@ from . import workflows
 from .config import PipelineConfig
 from .data import prepare_model_population, split_assignments, split_report
 from .evaluation import write_json_new
+
+# Paths each stage needs; filled from --run-name/--modality when not given explicitly.
+RUN_INPUTS = {
+    "evaluate_stage1": ("checkpoint",),
+    "predict_stage1": ("checkpoint",),
+    "precompute_features": ("stage1_checkpoint",),
+    "train_stage2": ("stage1_checkpoint", "stage1_features"),
+    "evaluate_stage2": ("stage1_checkpoint", "stage1_features", "checkpoint"),
+    "predict_stage2": ("stage1_checkpoint", "stage1_features", "checkpoint"),
+}
 
 
 def prepare(args):
@@ -29,6 +24,42 @@ def prepare(args):
     write_json_new(config.split_report, report)
     print(json.dumps({"population": population, "splits": report, "model_pages": str(config.model_pages_csv),
                       "excluded_stacks": str(config.excluded_stacks_report)}, indent=2))
+
+
+def best_checkpoint(config, model_prefix, modality, run_name):
+    """Best checkpoint of a run with the highest epoch.
+
+    Training writes a *_best_epoch_NNN.pt file only when validation macro-F1 improves, so the highest
+    epoch is the best one. Epochs are zero-padded, so name order is epoch order.
+    """
+    pattern = f"{model_prefix}_{modality}_{run_name}_best_epoch_*.pt"
+    matches = sorted(config.checkpoints_dir.glob(pattern))
+    if not matches:
+        raise FileNotFoundError(f"No {pattern} in {config.checkpoints_dir}")
+    return matches[-1]
+
+
+def resolve_run_inputs(args, parser):
+    """Fill the paths a stage needs from --run-name/--modality; explicit paths are kept as given."""
+    needed = RUN_INPUTS.get(args.stage)
+    if not needed:
+        return
+    if args.run_name:
+        if not args.modality:
+            parser.error("--modality is required with --run-name")
+        config = PipelineConfig(batch_id=args.batch_id)
+        if "stage1_checkpoint" in needed and not args.stage1_checkpoint:
+            args.stage1_checkpoint = best_checkpoint(config, "model_stage1", args.modality, args.run_name)
+        if "stage1_features" in needed and not args.stage1_features:
+            args.stage1_features = workflows.default_features_dir(config, args.stage1_checkpoint, args.modality)
+        if "checkpoint" in needed and not args.checkpoint:
+            prefix = "model_stage1" if args.stage in ("evaluate_stage1", "predict_stage1") else "model_final"
+            args.checkpoint = best_checkpoint(config, prefix, args.modality, args.run_name)
+    missing = [name for name in needed if not getattr(args, name)]
+    if missing:
+        parser.error("give --run-name and --modality, or " + ", ".join("--" + name.replace("_", "-") for name in missing))
+    for name in needed:
+        print(f"{name}: {getattr(args, name)}")
 
 
 def build_parser():
@@ -54,9 +85,15 @@ def build_parser():
         command.add_argument("--use-fp16", action="store_true")
         command.add_argument("--use-bf16", action="store_true")
 
+    def run_lookup(command, run_name=True):
+        """--run-name/--modality as an alternative to explicit checkpoint and feature paths."""
+        if run_name:
+            command.add_argument("--run-name", help="find the run's best checkpoint and features")
+        command.add_argument("--modality", choices=["vision", "text", "fusion"], help="modality of the run (with --run-name)")
+
     def stage2_inputs(command):
-        command.add_argument("--stage1-checkpoint", required=True)
-        command.add_argument("--stage1-features", required=True, help="directory written by precompute_features")
+        command.add_argument("--stage1-checkpoint")
+        command.add_argument("--stage1-features", help="directory written by precompute_features")
         command.add_argument("--max-pages-per-batch", type=int, default=2048,
                              help="padded pages per batch; stacks of similar length are batched together")
 
@@ -78,29 +115,30 @@ def build_parser():
     command.add_argument("--lr-decay-to", type=float, default=2e-6)
     balance(command)
     command.add_argument("--resume"); command.add_argument("--run-name")
-    command = stage("evaluate_stage1", batch_size=8); precision(command)
-    command.add_argument("--checkpoint", required=True)
+    command = stage("evaluate_stage1", batch_size=8); precision(command); run_lookup(command)
+    command.add_argument("--checkpoint")
     command.add_argument("--split", choices=["train", "val", "test"], default="test")
     command.add_argument("--output", help="optional; defaults to the batch results folder")
-    command = stage("predict_stage1", batch_size=8)
-    command.add_argument("--checkpoint", required=True)
+    command = stage("predict_stage1", batch_size=8); run_lookup(command)
+    command.add_argument("--checkpoint")
     command.add_argument("--output", help="optional; defaults to the batch results folder")
 
-    command = stage("precompute_features", batch_size=8); subset(command)
-    command.add_argument("--stage1-checkpoint", required=True)
+    command = stage("precompute_features", batch_size=8); subset(command); run_lookup(command)
+    command.add_argument("--stage1-checkpoint")
     command.add_argument("--output", help="default: stage1_features_<modality>_<checkpoint name> in the output folder")
 
-    command = stage("train_stage2"); stage2_inputs(command)
+    command = stage("train_stage2"); stage2_inputs(command); run_lookup(command, run_name=False)
     command.add_argument("--epochs", type=int, default=5)
     command.add_argument("--lr", type=float, default=1e-4)
     balance(command)
-    command.add_argument("--resume"); command.add_argument("--run-name")
-    command = stage("evaluate_stage2"); stage2_inputs(command)
-    command.add_argument("--checkpoint", required=True)
+    command.add_argument("--resume")
+    command.add_argument("--run-name", help="finds the Stage 1 run and names the Stage 2 outputs")
+    command = stage("evaluate_stage2"); stage2_inputs(command); run_lookup(command)
+    command.add_argument("--checkpoint")
     command.add_argument("--split", choices=["train", "val", "test"], default="test")
     command.add_argument("--output", help="optional; defaults to the batch results folder")
-    command = stage("predict_stage2"); stage2_inputs(command)
-    command.add_argument("--checkpoint", required=True)
+    command = stage("predict_stage2"); stage2_inputs(command); run_lookup(command)
+    command.add_argument("--checkpoint")
     command.add_argument("--output", help="optional; defaults to the batch results folder")
     return parser
 
@@ -121,5 +159,7 @@ STAGES = {
 
 
 if __name__ == "__main__":
-    args = build_parser().parse_args()
+    parser = build_parser()
+    args = parser.parse_args()
+    resolve_run_inputs(args, parser)
     STAGES[args.stage](args)
