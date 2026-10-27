@@ -1,9 +1,9 @@
 # Page Classification and Document Segmentation
 
-This pipeline takes an incoming stack of scanned pages, in its original order,
-and for every page predicts:
+This pipeline classifies the pages of Life Antrag stacks. It takes an incoming
+stack of scanned pages, in its original order, and for every page predicts:
 
-- which document class it belongs to, and
+- its class: `A00`, `G07`, `MAD` or `TB0` (Technikblatt pages inside `A00` documents), and
 - whether a new document starts on that page.
 
 From these two predictions the stack is split into its documents.
@@ -12,24 +12,9 @@ From these two predictions the stack is split into its documents.
 
 The pipeline has two stages, following the PnC architecture.
 
-**Stage 1: page model.** Each page is classified on its own. The text of the
-page (from OCR) is read by a fine-tuned **GBERT-large** model. In the fusion
-setting, an image vector of the page from **OpenCLIP ViT-H-14** is added to the
-text input. For every page the model predicts the class, whether it is the
-first page of a document, and whether it is the last page.
+- **Stage 1: page model.** 
+- **Stage 2: sequence model.**
 
-**Stage 2: sequence model.** The trained Stage 1 model is frozen and turns every
-page into a feature vector. A two-layer **GRU** then reads the pages of a whole
-stack in order. Using the context of the pages around it, it predicts each
-page's class and whether a document starts there.
-
-Three input settings are available:
-
-| Setting | Uses | Note |
-|---|---|---|
-| `fusion` | text and image | main setting |
-| `text` | text only | |
-| `vision` | image only | baseline; Stage 1 training does not reach Stage 2 |
 
 ## Structure
 
@@ -44,7 +29,7 @@ classification/
 │   ├── workflows.py    the individual steps
 │   ├── evaluation.py   metrics
 │   └── main.py         command-line entry point
-├── gwg/                optional: labelling of identification pages with an LLM
+├── gwg/                optional: finding GWG identification pages from the OCR text
 ├── output/             intermediate files and model checkpoints, per batch
 └── results/            metrics and predictions, per batch
 ```
@@ -122,14 +107,10 @@ be given with `--checkpoint`, `--stage1-checkpoint` or `--stage1-features`.
 
 Existing files are never overwritten. Each run needs a new `--run-name` or a new output path.
 
-## GWG labelling (optional)
+## GWG pages (optional)
 
-`gwg/` finds pages with an identification table and labels them with an LLM:
+`gwg/` finds pages with a GWG identification table, using the OCR text from step 2:
 
 ```bash
-python -m life_docai_analytics_antrag.classification.gwg.candidates --batch-id <batch_id> --run-name <name>
-python -m life_docai_analytics_antrag.classification.gwg.llm_label --batch-id <batch_id> --run-name <name>
+PYTHONPATH=packages/life-docai-analytics pixi run -e dev python -m life_docai_analytics_antrag.classification.gwg.candidates --batch-id <batch_id> --run-name <run_name>
 ```
-
-The LLM endpoint is configured with environment variables. Use only an
-approved endpoint, because the pages contain personal data.
