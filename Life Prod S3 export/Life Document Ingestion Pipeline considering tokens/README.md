@@ -33,7 +33,11 @@ and images stay on the local server.
 
 ## Running a new batch
 
-Run from this directory (output paths are relative to it).
+Run from the pipeline directory; output paths are relative to it.
+
+```bash
+cd ~/Projects/life-docai/packages/life-docai-analytics/life_docai_analytics_antrag/datasets/aws_download_ingestion
+```
 
 ```bash
 # Step 1 - WITH tokens: download only. Prints the derived batch_id.
