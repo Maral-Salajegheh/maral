@@ -56,3 +56,14 @@ include = ["life_docai_analytics_antrag*"]
 
 
 du -h --max-depth=4 packages/life-docai-analytics | sort -h | tail -20
+
+
+
+git add \
+packages/life-docai-analytics/pyproject.toml \
+packages/life-docai-analytics/life_docai_analytics_antrag/__init__.py \
+packages/life-docai-analytics/life_docai_analytics_antrag/README.md \
+packages/life-docai-analytics/life_docai_analytics_antrag/classification/**/*.py \
+packages/life-docai-analytics/life_docai_analytics_antrag/classification/**/README.md \
+packages/life-docai-analytics/life_docai_analytics_antrag/datasets/**/*.py \
+packages/life-docai-analytics/life_docai_analytics_antrag/datasets/**/README.md
