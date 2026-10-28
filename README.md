@@ -35,3 +35,20 @@ ls model.py models.py training.py 2>/dev/null
 
 python -c "import life_docai_analytics_antrag; print(life_docai_analytics_antrag.__file__)"
 python -m pip show life-docai
+
+
+
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "life-docai-analytics"
+version = "0.1.0"
+description = "Analytics components for Life DocAI"
+requires-python = ">=3.11"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["life_docai_analytics_antrag*"]
