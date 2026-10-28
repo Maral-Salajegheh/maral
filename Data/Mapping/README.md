@@ -21,8 +21,10 @@ MasterIndex PDF. The classification pipeline reads its labels from here.
 
 ## Running
 
+Run from this folder (paths below are relative to the repository root):
+
 ```bash
-cd ~/Projects/life-docai/packages/life-docai-analytics/life_docai_analytics_antrag/datasets/mapping
+cd packages/life-docai-analytics/life_docai_analytics_antrag/datasets/mapping
 
 # Mapping only (Analyse-DB tables already built)
 pixi run -e dev python 00_map_mid_to_adb.py --schema <SCHEMA>
