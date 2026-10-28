@@ -52,3 +52,7 @@ requires-python = ">=3.11"
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["life_docai_analytics_antrag*"]
+
+
+
+du -h --max-depth=4 packages/life-docai-analytics | sort -h | tail -20
