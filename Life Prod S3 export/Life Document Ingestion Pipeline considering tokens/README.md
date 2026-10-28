@@ -33,10 +33,11 @@ and images stay on the local server.
 
 ## Running a new batch
 
-Run from the pipeline directory; output paths are relative to it.
+Run from the pipeline directory; output paths are relative to it. From the
+repository root:
 
 ```bash
-cd ~/Projects/life-docai/packages/life-docai-analytics/life_docai_analytics_antrag/datasets/aws_download_ingestion
+cd packages/life-docai-analytics/life_docai_analytics_antrag/datasets/aws_download_ingestion
 ```
 
 ```bash
