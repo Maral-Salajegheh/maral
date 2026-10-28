@@ -109,8 +109,11 @@ Existing files are never overwritten. Each run needs a new `--run-name` or a new
 
 ## GWG pages (optional)
 
+Uses the existing OCR cache; does not run OCR, CLIP or an LLM.
+Writes gwg_page_scores.csv, gwg_review_sheet.csv and gwg_manifest.json to **`output/<batch_id>/gwg/<run_name>/`**.
+
 `gwg/` finds pages with a GWG identification table, using the OCR text from step 2:
 
 ```bash
-PYTHONPATH=packages/life-docai-analytics pixi run -e dev python -m life_docai_analytics_antrag.classification.gwg.candidates --batch-id <batch_id> --run-name <run_name>
+PYTHONPATH=packages/life-docai-analytics pixi run -e dev python -m life_docai_analytics_antrag.classification.gwg.gwg_candidate --batch-id <batch_id> --run-name <run_name>
 ```
