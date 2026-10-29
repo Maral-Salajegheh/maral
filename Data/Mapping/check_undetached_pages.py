@@ -22,6 +22,7 @@ mapping's page allocation.
 
     python check_undetached_pages.py
     python check_undetached_pages.py --batch-id <other_batch>
+    python packages/life-docai-analytics/life_docai_analytics_antrag/datasets/mapping/check_undetached_pages.py
 """
 
 from __future__ import annotations
