@@ -7,17 +7,30 @@ TB0 is not detected with OCR. The final page table already carries the
 verified document class in sfdoc_class. A page is labelled TB0 when its
 sfdoc_class contains "Technikblatt"; otherwise its existing SST is retained.
 
-The PDF page of each row inside its stack PDF is computed with the rule
-verified on real documents: a document starts right after all pages of the
-documents delivered before it in the stack, and seqno gives the position
-inside the document. Documents are ordered by where their first row appears in
-the Snowflake result, so the rule runs before any sorting.
+pdf_page_number is the page position inside the row's own MasterIndex PDF.
+It is produced in two ways:
 
-Run from life-docai/Antrag/Datasets/Mapping:
+  INVENTORY  The MID is rendered. Positions come from page_inventory.parquet.
+             A MasterIndex PDF can hold a page that Analyse-DB assigns to a
+             sibling MID of the same stack, because the page was never
+             physically detached; such a page can sit anywhere in the PDF, not
+             only at the end. It is recognised because the same rendered image
+             also appears under that sibling, so both carry the same
+             image_sha256. Those positions are removed and the MID's label
+             rows take the remaining positions in order.
+
+  ARITHMETIC The MID is not rendered. The position is computed as before: a
+             document starts right after all pages of the documents delivered
+             before it in the same MID, and seqno gives the position inside the
+             document.
+
+pdf_page_source says which was used, and mid_alignment_status says why.
+
+Run from the mapping directory:
 
     pixi run -e dev python 00_map_mid_to_adb.py --schema D131_D2D
 
-Outputs are written to the existing Mapping/output directory:
+Outputs are written to the existing output directory:
 
     life_mid_documents.csv
     life_mid_documents.parquet
@@ -43,7 +56,11 @@ DEFAULT_SCHEMA = "D131_D2D"
 MAPPING_FILE = Path(
     "/home/shared_folders/life_ai/mid_mapping/Antrag_A00_G07_MAD.csv"
 )
-OUTPUT_DIR = Path(__file__).resolve().parent / "output"
+MAPPING_DIR = Path(__file__).resolve().parent
+OUTPUT_DIR = MAPPING_DIR / "output"
+
+DEFAULT_BATCH_ID = "antrag_life_A00_G07_MAD"
+INGESTION_DIR = MAPPING_DIR.parent / "aws_download_ingestion"
 
 SOURCE_PAGE_TABLE = "PROC_LIFE_FINAL_PAGE_LABELS"
 SNOWFLAKE_OUTPUT_TABLE = "PROC_LIFE_MID_ADB"
@@ -235,7 +252,8 @@ def load_page_labels(
     """Read final page rows only for stacks present in the input file.
 
     delivery_row records the order in which Snowflake returned the rows. The
-    PDF-page rule depends on that order, so it is captured before any sort.
+    arithmetic page rule depends on that order, so it is captured before any
+    sort, and it identifies a page row for the rest of the run.
     """
     if not stack_ids:
         raise ValueError("The MasterIndex mapping contains no usable stack_id.")
@@ -302,44 +320,6 @@ def prepare_page_labels(data: pd.DataFrame) -> pd.DataFrame:
     data["image_id_num"] = pd.to_numeric(data["image_id"], errors="coerce")
     data["seqno_num"] = pd.to_numeric(data["seqno"], errors="coerce")
     return data.reset_index(drop=True)
-
-
-# ---------------------------------------------------------------------------
-# PDF page inside the stack PDF
-# ---------------------------------------------------------------------------
-
-def document_offsets(pages: pd.DataFrame) -> pd.DataFrame:
-    """Pages before each document inside its own MasterIndex PDF.
-
-    Documents are ordered by where their first row appears in the delivery.
-    A new masterindex_id is a new PDF, so the count restarts there.
-    """
-    keys = DOCUMENT_KEYS + ["masterindex_id"]
-    documents = (
-        pages.groupby(keys, dropna=False)
-        .agg(first_row=("delivery_row", "min"), n_doc_pages=("image_id", "size"))
-        .reset_index()
-        .sort_values(["masterindex_id", "first_row"])
-    )
-    documents["pages_before"] = (
-        documents.groupby("masterindex_id")["n_doc_pages"].cumsum()
-        - documents["n_doc_pages"]
-    )
-    return documents[keys + ["pages_before"]]
-
-
-def add_pdf_page_number(pages: pd.DataFrame) -> pd.DataFrame:
-    """Page position inside the row's own MasterIndex PDF."""
-    keys = DOCUMENT_KEYS + ["masterindex_id"]
-    pages = pages.merge(document_offsets(pages), on=keys, how="left")
-    pages["pdf_page_number"] = (
-        pages["pages_before"] + pages["seqno_num"]
-    ).astype("Int64")
-    pages["pdf_page_number_duplicate"] = pages.duplicated(
-        ["masterindex_id", "pdf_page_number"],
-        keep=False,
-    )
-    return pages.drop(columns=["pages_before"]).reset_index(drop=True)
 
 
 # ---------------------------------------------------------------------------
@@ -442,6 +422,354 @@ def classify_documents(data: pd.DataFrame) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
+# Page rows of mapped documents
+# ---------------------------------------------------------------------------
+
+CARRY_FROM_DOCUMENTS = [
+    "masterindex_id",
+    "mid_sst",
+    "mapping_status",
+    "is_usable",
+    "is_training_eligible",
+]
+
+
+def attach_masterindex(
+    page_labels: pd.DataFrame,
+    documents: pd.DataFrame,
+) -> pd.DataFrame:
+    """Page rows of every mapped document, usable or not.
+
+    Alignment against the rendered PDF needs all of a MID's pages; filtering
+    to usable documents first would make a partly usable MID look short.
+    """
+    mapped = documents[documents["masterindex_id"].notna()]
+    mapped = mapped[DOCUMENT_KEYS + CARRY_FROM_DOCUMENTS].drop_duplicates(
+        DOCUMENT_KEYS
+    )
+    return page_labels.merge(
+        mapped,
+        on=DOCUMENT_KEYS,
+        how="inner",
+        validate="many_to_one",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Arithmetic page position, used when a MID is not rendered
+# ---------------------------------------------------------------------------
+
+def document_offsets(pages: pd.DataFrame) -> pd.DataFrame:
+    """Pages before each document inside its own MasterIndex PDF.
+
+    Documents are ordered by where their first row appears in the delivery.
+    A new masterindex_id is a new PDF, so the count restarts there.
+    """
+    keys = DOCUMENT_KEYS + ["masterindex_id"]
+    documents = (
+        pages.groupby(keys, dropna=False)
+        .agg(first_row=("delivery_row", "min"), n_doc_pages=("image_id", "size"))
+        .reset_index()
+        .sort_values(["masterindex_id", "first_row"])
+    )
+    documents["pages_before"] = (
+        documents.groupby("masterindex_id")["n_doc_pages"].cumsum()
+        - documents["n_doc_pages"]
+    )
+    return documents[keys + ["pages_before"]]
+
+
+def add_arithmetic_page_number(pages: pd.DataFrame) -> pd.DataFrame:
+    """Computed page position inside the row's own MasterIndex PDF."""
+    keys = DOCUMENT_KEYS + ["masterindex_id"]
+    pages = pages.merge(document_offsets(pages), on=keys, how="left")
+    pages["arithmetic_page_number"] = (
+        pages["pages_before"] + pages["seqno_num"]
+    ).astype("Int64")
+    return pages.drop(columns=["pages_before"]).reset_index(drop=True)
+
+
+# ---------------------------------------------------------------------------
+# Rendered page inventory
+# ---------------------------------------------------------------------------
+
+INVENTORY_COLUMNS = [
+    "masterindex_id",
+    "source_page_number",
+    "image_sha256",
+    "quality_status",
+    "status",
+]
+# A blank or near-blank page renders to the same pixels in any PDF, so a hash
+# match on one is coincidence, not evidence of a shared scan.
+UNRELIABLE_QUALITY = {"likely_blank", "too_small"}
+
+NOT_RENDERED = "NOT_RENDERED"
+ALIGNED = "ALIGNED"
+RESOLVED_FOREIGN = "RESOLVED_FOREIGN"
+
+
+def default_inventory(batch_id: str) -> Path:
+    """Page inventory written by the rendering stage."""
+    return INGESTION_DIR / "output" / batch_id / "page_inventory.parquet"
+
+
+def read_inventory(path: Path) -> pd.DataFrame:
+    """Successfully rendered pages, one row per physical page."""
+    data = pd.read_parquet(path)
+    data.columns = [str(column).strip().lower() for column in data.columns]
+
+    missing = [
+        column for column in ["masterindex_id", "source_page_number", "image_sha256"]
+        if column not in data.columns
+    ]
+    if missing:
+        raise ValueError(
+            f"page_inventory is missing columns: {missing}\n"
+            f"Available: {sorted(data.columns)}"
+        )
+
+    keep = [column for column in INVENTORY_COLUMNS if column in data.columns]
+    data = data[keep].copy()
+    data["masterindex_id"] = data["masterindex_id"].map(clean)
+    data["source_page_number"] = pd.to_numeric(
+        data["source_page_number"], errors="coerce"
+    )
+    return data
+
+
+def keep_successful_renders(inventory: pd.DataFrame) -> pd.DataFrame:
+    """Drop failed renders; they carry no image and no hash."""
+    total = len(inventory)
+    data = inventory
+    if "status" in data.columns:
+        data = data[data["status"].eq("success")]
+    data = data[
+        data["masterindex_id"].notna()
+        & data["source_page_number"].notna()
+        & data["image_sha256"].notna()
+    ]
+    dropped = total - len(data)
+    if dropped:
+        print(f"Inventory: dropped {dropped:,} rows that are not successful renders.")
+    return data.reset_index(drop=True)
+
+
+def check_inventory_unique(inventory: pd.DataFrame) -> None:
+    """One row per physical page, or the counts below would be wrong."""
+    duplicated = inventory.duplicated(["masterindex_id", "source_page_number"])
+    if duplicated.any():
+        raise ValueError(
+            f"page_inventory has {int(duplicated.sum()):,} duplicate "
+            "(masterindex_id, source_page_number) rows. Point --inventory at a "
+            "single merged inventory."
+        )
+
+
+def load_inventory(path: Path) -> pd.DataFrame:
+    """Read, filter and validate the rendered page inventory."""
+    if not path.is_file():
+        raise FileNotFoundError(f"Page inventory not found: {path}")
+    inventory = keep_successful_renders(read_inventory(path))
+    check_inventory_unique(inventory)
+    print(f"Inventory: {len(inventory):,} rendered pages in "
+          f"{inventory['masterindex_id'].nunique():,} MasterIndex IDs.")
+    return inventory
+
+
+# ---------------------------------------------------------------------------
+# Foreign pages: rendered pages belonging to a sibling MID
+# ---------------------------------------------------------------------------
+
+def mid_to_stack(mid_pages: pd.DataFrame) -> pd.DataFrame:
+    """One stack per MasterIndex ID."""
+    return (
+        mid_pages[["masterindex_id", "stack_id_key"]]
+        .dropna()
+        .drop_duplicates("masterindex_id")
+    )
+
+
+def hash_evidence_pages(
+    inventory: pd.DataFrame,
+    stacks: pd.DataFrame,
+) -> pd.DataFrame:
+    """Rendered pages whose hash can carry evidence of a shared scan."""
+    data = inventory.merge(stacks, on="masterindex_id", how="inner")
+    if "quality_status" in data.columns:
+        data = data[~data["quality_status"].isin(UNRELIABLE_QUALITY)]
+    return data
+
+
+def find_foreign_pages(
+    inventory: pd.DataFrame,
+    stacks: pd.DataFrame,
+) -> pd.DataFrame:
+    """Pages whose image also appears under another MID of the same stack.
+
+    Only cross-MID matches inside one stack count. Two identical pages within
+    one MID are not evidence of a foreign page.
+    """
+    scope = hash_evidence_pages(inventory, stacks)
+    pairs = scope.merge(
+        scope[["stack_id_key", "image_sha256", "masterindex_id"]],
+        on=["stack_id_key", "image_sha256"],
+        suffixes=("", "_other"),
+    )
+    pairs = pairs[pairs["masterindex_id"].ne(pairs["masterindex_id_other"])]
+    return pairs[["masterindex_id", "source_page_number"]].drop_duplicates()
+
+
+def group_positions(data: pd.DataFrame) -> dict[str, list[int]]:
+    """MasterIndex ID to its page positions, ascending."""
+    if data.empty:
+        return {}
+    grouped = data.groupby("masterindex_id")["source_page_number"]
+    return {mid: sorted(int(p) for p in values)
+            for mid, values in grouped}
+
+
+# ---------------------------------------------------------------------------
+# Allocating label rows onto rendered positions
+# ---------------------------------------------------------------------------
+
+def align_one_mid(
+    positions: list[int],
+    foreign: set[int],
+    n_rows: int,
+) -> tuple[list[int], str]:
+    """Positions for one MID's label rows, and the reason for the outcome."""
+    extra = len(positions) - n_rows
+    if extra < 0:
+        return [], "UNRESOLVED_MISSING_IMAGES"
+    if extra == 0:
+        return positions, ALIGNED
+
+    usable = [position for position in positions if position not in foreign]
+    if len(usable) != n_rows:
+        reason = ("UNRESOLVED_NO_HASH_MATCH" if not foreign
+                  else "UNRESOLVED_COUNT_MISMATCH")
+        return [], reason
+    return usable, RESOLVED_FOREIGN
+
+
+def mid_row_order(mid_pages: pd.DataFrame) -> pd.DataFrame:
+    """Label rows of each MID in arithmetic page order."""
+    return mid_pages.sort_values(
+        ["masterindex_id", "arithmetic_page_number", "delivery_row"],
+        na_position="last",
+    )
+
+
+def has_ambiguous_order(rows: pd.DataFrame) -> bool:
+    """A missing or repeated arithmetic position leaves the row order unknown."""
+    numbers = rows["arithmetic_page_number"]
+    return bool(numbers.isna().any() or numbers.duplicated().any())
+
+
+def align_mids(
+    mid_pages: pd.DataFrame,
+    positions_by_mid: dict[str, list[int]],
+    foreign_by_mid: dict[str, list[int]],
+) -> pd.DataFrame:
+    """Per page row: the rendered position it was allocated, and the MID status."""
+    records = []
+    for masterindex_id, rows in mid_row_order(mid_pages).groupby(
+        "masterindex_id", sort=False
+    ):
+        positions = positions_by_mid.get(masterindex_id)
+        if positions is None:
+            status, allocated = NOT_RENDERED, []
+        elif has_ambiguous_order(rows):
+            status, allocated = "UNRESOLVED_AMBIGUOUS_ORDER", []
+        else:
+            foreign = set(foreign_by_mid.get(masterindex_id, []))
+            allocated, status = align_one_mid(positions, foreign, len(rows))
+
+        records.append(alignment_record(rows, allocated, status,
+                                        positions, foreign_by_mid))
+    return pd.concat(records, ignore_index=True)
+
+
+def alignment_record(
+    rows: pd.DataFrame,
+    allocated: list[int],
+    status: str,
+    positions: Optional[list[int]],
+    foreign_by_mid: dict[str, list[int]],
+) -> pd.DataFrame:
+    """One frame of alignment columns for a single MID's rows."""
+    masterindex_id = rows["masterindex_id"].iloc[0]
+    return pd.DataFrame({
+        "delivery_row": rows["delivery_row"].values,
+        "inventory_page_number": pd.array(
+            allocated if allocated else [pd.NA] * len(rows), dtype="Int64"
+        ),
+        "mid_alignment_status": status,
+        "mid_rendered_pages": pd.array(
+            [len(positions) if positions is not None else pd.NA] * len(rows),
+            dtype="Int64",
+        ),
+        "mid_foreign_pages": len(foreign_by_mid.get(masterindex_id, [])),
+    })
+
+
+def build_alignment(
+    mid_pages: pd.DataFrame,
+    inventory: Optional[pd.DataFrame],
+) -> pd.DataFrame:
+    """Alignment columns for every mapped page row."""
+    if inventory is None or inventory.empty:
+        return pd.DataFrame({
+            "delivery_row": mid_pages["delivery_row"].values,
+            "inventory_page_number": pd.array([pd.NA] * len(mid_pages),
+                                              dtype="Int64"),
+            "mid_alignment_status": NOT_RENDERED,
+            "mid_rendered_pages": pd.array([pd.NA] * len(mid_pages),
+                                           dtype="Int64"),
+            "mid_foreign_pages": 0,
+        })
+
+    stacks = mid_to_stack(mid_pages)
+    positions_by_mid = group_positions(inventory)
+    foreign_by_mid = group_positions(find_foreign_pages(inventory, stacks))
+    return align_mids(mid_pages, positions_by_mid, foreign_by_mid)
+
+
+# ---------------------------------------------------------------------------
+# Final page position
+# ---------------------------------------------------------------------------
+
+def choose_page_number(pages: pd.DataFrame) -> pd.DataFrame:
+    """Prefer the rendered position; fall back to the computed one."""
+    pages = pages.copy()
+    from_inventory = pages["inventory_page_number"].notna()
+    pages["pdf_page_number"] = pages["arithmetic_page_number"]
+    pages.loc[from_inventory, "pdf_page_number"] = pages.loc[
+        from_inventory, "inventory_page_number"
+    ]
+    pages["pdf_page_source"] = "ARITHMETIC"
+    pages.loc[from_inventory, "pdf_page_source"] = "INVENTORY"
+    pages["pdf_page_number_duplicate"] = pages.duplicated(
+        ["masterindex_id", "pdf_page_number"],
+        keep=False,
+    )
+    return pages
+
+
+def add_page_positions(
+    mid_pages: pd.DataFrame,
+    inventory: Optional[pd.DataFrame],
+) -> pd.DataFrame:
+    """Give every mapped page row its position inside its MasterIndex PDF."""
+    mid_pages = add_arithmetic_page_number(mid_pages)
+    alignment = build_alignment(mid_pages, inventory)
+    return choose_page_number(
+        mid_pages.merge(alignment, on="delivery_row", how="left", validate="one_to_one")
+    )
+
+
+# ---------------------------------------------------------------------------
 # Page-level output and TB0 label
 # ---------------------------------------------------------------------------
 
@@ -460,29 +788,8 @@ def make_page_class(data: pd.DataFrame) -> pd.DataFrame:
     return data
 
 
-def build_pages(
-    page_labels: pd.DataFrame,
-    documents: pd.DataFrame,
-) -> pd.DataFrame:
-    """Return exact Analyse-DB page rows for usable mapped documents."""
-    usable = documents[documents["is_usable"]].copy()
-    if usable.empty:
-        return pd.DataFrame()
-
-    carry = DOCUMENT_KEYS + [
-        "masterindex_id",
-        "mid_sst",
-        "mapping_status",
-        "is_usable",
-        "is_training_eligible",
-    ]
-    usable = usable[carry].drop_duplicates(DOCUMENT_KEYS)
-    pages = page_labels.merge(
-        usable,
-        on=DOCUMENT_KEYS,
-        how="inner",
-        validate="many_to_one",
-    )
+def add_document_page_numbers(pages: pd.DataFrame) -> pd.DataFrame:
+    """Position of each page inside its own Analyse-DB document."""
     pages = order_pages(pages).copy()
     pages["page_number"] = (
         pages.groupby(DOCUMENT_KEYS, dropna=False).cumcount() + 1
@@ -492,9 +799,19 @@ def build_pages(
     ].transform("size")
     pages["is_first_page"] = pages["page_number"].eq(1)
     pages["is_last_page"] = pages["page_number"].eq(pages["n_pages"])
-    pages = add_pdf_page_number(make_page_class(pages))
-    # page_number needed seqno order above; the output follows Snowflake's order.
-    return pages.sort_values(["stack_id_key", "delivery_row"]).reset_index(drop=True)
+    return pages
+
+
+def build_pages(mid_pages: pd.DataFrame) -> pd.DataFrame:
+    """Page rows of usable mapped documents, in Snowflake order."""
+    usable = mid_pages[mid_pages["is_usable"]].copy()
+    if usable.empty:
+        return pd.DataFrame()
+
+    pages = make_page_class(add_document_page_numbers(usable))
+    return pages.sort_values(
+        ["stack_id_key", "delivery_row"]
+    ).reset_index(drop=True)
 
 
 # ---------------------------------------------------------------------------
@@ -533,7 +850,12 @@ PAGE_COLUMNS = [
     "seqno",
     "delivery_row",
     "pdf_page_number",
+    "pdf_page_source",
     "pdf_page_number_duplicate",
+    "mid_alignment_status",
+    "mid_rendered_pages",
+    "mid_foreign_pages",
+    "arithmetic_page_number",
     "page_number",
     "n_pages",
     "sst",
@@ -594,8 +916,31 @@ def write_outputs(documents: pd.DataFrame, pages: pd.DataFrame) -> None:
     )
 
 
-def print_pdf_page_report(pages: pd.DataFrame) -> None:
-    """How many MasterIndex PDFs the page-number rule placed without a collision."""
+def print_alignment_report(pages: pd.DataFrame) -> None:
+    """Where each MasterIndex PDF's page positions came from."""
+    by_mid = pages.drop_duplicates("masterindex_id")
+    print("\nPage positions per MasterIndex ID:")
+    print(by_mid["mid_alignment_status"].value_counts(dropna=False).to_string())
+
+    print("\nPage positions per row:")
+    print(pages["pdf_page_source"].value_counts(dropna=False).to_string())
+
+    foreign = int(by_mid.loc[by_mid["mid_alignment_status"].eq(RESOLVED_FOREIGN),
+                             "mid_foreign_pages"].sum())
+    if foreign:
+        print(f"\nForeign pages removed: {foreign:,} in "
+              f"{int(by_mid['mid_alignment_status'].eq(RESOLVED_FOREIGN).sum()):,} "
+              "MasterIndex PDFs.")
+
+    unresolved = by_mid["mid_alignment_status"].str.startswith("UNRESOLVED")
+    if unresolved.any():
+        print(f"\nWARNING: {int(unresolved.sum()):,} rendered MasterIndex PDFs "
+              "could not be aligned. Their rows keep the computed page number "
+              "and must not be used for training.")
+
+
+def print_duplicate_report(pages: pd.DataFrame) -> None:
+    """How many MasterIndex PDFs ended with a repeated page position."""
     by_mid = pages.groupby("masterindex_id")["pdf_page_number_duplicate"].any()
     n_bad = int(by_mid.sum())
     print(f"\nMIDs with a duplicate pdf_page_number: {n_bad:,} of {len(by_mid):,}")
@@ -620,7 +965,8 @@ def print_report(documents: pd.DataFrame, pages: pd.DataFrame) -> None:
         "TB0 documents: "
         f"{pages.loc[pages['page_class'].eq(TB0), DOCUMENT_KEYS].drop_duplicates().shape[0]:,}"
     )
-    print_pdf_page_report(pages)
+    print_alignment_report(pages)
+    print_duplicate_report(pages)
 
 
 # ---------------------------------------------------------------------------
@@ -674,14 +1020,35 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--schema", default=DEFAULT_SCHEMA)
     parser.add_argument("--mapping-file", type=Path, default=MAPPING_FILE)
+    parser.add_argument("--batch-id", default=DEFAULT_BATCH_ID)
+    parser.add_argument("--inventory", type=Path, default=None,
+                        help="Defaults to the batch's page_inventory.parquet.")
+    parser.add_argument("--no-inventory", action="store_true",
+                        help="Use computed page numbers only.")
     parser.add_argument("--publish-snowflake", action="store_true")
     parser.add_argument("--yes", action="store_true")
     return parser.parse_args()
 
 
+def resolve_inventory(args: argparse.Namespace) -> Optional[pd.DataFrame]:
+    """Load the page inventory unless it was switched off or is absent."""
+    if args.no_inventory:
+        print("Inventory disabled; using computed page numbers only.")
+        return None
+
+    path = args.inventory or default_inventory(args.batch_id)
+    if args.inventory is None and not path.is_file():
+        print(f"WARNING: no page inventory at {path}.\n"
+              "         Every page number will be computed, not verified.")
+        return None
+    return load_inventory(path)
+
+
 def build(args: argparse.Namespace, engine: sqlalchemy.Engine, schema: str) -> None:
     mapping = load_mapping(args.mapping_file)
     print(f"MasterIndex rows: {len(mapping):,}")
+
+    inventory = resolve_inventory(args)
 
     selected_stack_ids = mapping["stack_id_key"].dropna().unique().tolist()
     page_labels = load_page_labels(engine, schema, selected_stack_ids)
@@ -689,7 +1056,11 @@ def build(args: argparse.Namespace, engine: sqlalchemy.Engine, schema: str) -> N
 
     adb_documents = summarize_documents(page_labels)
     documents = classify_documents(join_mapping(mapping, adb_documents))
-    pages = build_pages(page_labels, documents)
+
+    mid_pages = add_page_positions(
+        attach_masterindex(page_labels, documents), inventory
+    )
+    pages = build_pages(mid_pages)
 
     write_outputs(documents, pages)
     print_report(documents, pages)
