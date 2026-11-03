@@ -1,19 +1,21 @@
+
 import argparse
 import json
+from pathlib import Path
 
 from . import workflows
 from .config import PipelineConfig
-from .data import prepare_model_population, split_assignments, split_report
-from .evaluation import write_json_new
+from .data import _file_record, prepare_model_population, read_csv, split_assignments, split_report
+from .evaluation import confidence_report, format_confidence_table, read_predictions, write_json_new
 
 # Paths each stage needs; filled from --run-name/--modality when not given explicitly.
 RUN_INPUTS = {
     "evaluate_stage1": ("checkpoint",),
-    "predict_stage1": ("checkpoint",),
     "precompute_features": ("stage1_checkpoint",),
     "train_stage2": ("stage1_checkpoint", "stage1_features"),
     "evaluate_stage2": ("stage1_checkpoint", "stage1_features", "checkpoint"),
     "predict_stage2": ("stage1_checkpoint", "stage1_features", "checkpoint"),
+    "report": ("predictions",),
 }
 
 
@@ -24,6 +26,29 @@ def prepare(args):
     write_json_new(config.split_report, report)
     print(json.dumps({"population": population, "splits": report, "model_pages": str(config.model_pages_csv),
                       "excluded_stacks": str(config.excluded_stacks_report)}, indent=2))
+
+
+def split_rows(config, predictions, split):
+    """Prediction rows of one split, using the batch's stack_splits.csv."""
+    splits = {row["stack_id"]: row["split"] for row in read_csv(config.split_file)}
+    rows = [row for row in read_predictions(predictions) if splits.get(row["stack_id"]) == split]
+    if not rows:
+        raise ValueError(f"No predictions for split {split} in {predictions}")
+    return rows
+
+
+def report(args):
+    """Confidence report on an existing predictions CSV: coverage and metrics per threshold."""
+    config = PipelineConfig(batch_id=args.batch_id)
+    rows = split_rows(config, args.predictions, args.split)
+    results = confidence_report(rows, args.thresholds, args.level)
+    output = Path(args.output) if args.output else \
+        config.results_dir / f"report_{args.split}_{args.level}_{Path(args.predictions).stem}.json"
+    write_json_new(output, {"split": args.split, "level": args.level, "pages": len(rows), "results": results,
+                            "inputs": {"predictions": _file_record(args.predictions),
+                                       "splits": _file_record(config.split_file)}})
+    print(format_confidence_table(results))
+    print(output)
 
 
 def best_checkpoint(config, model_prefix, modality, run_name):
@@ -39,6 +64,29 @@ def best_checkpoint(config, model_prefix, modality, run_name):
     return matches[-1]
 
 
+def predictions_file(config, modality, run_name):
+    """CSV that predict_stage2 wrote for the run's best Stage 2 checkpoint."""
+    checkpoint = best_checkpoint(config, "model_final", modality, run_name)
+    path = config.results_dir / f"predictions_final_{checkpoint.stem}.csv"
+    if not path.is_file():
+        raise FileNotFoundError(f"No predictions for {checkpoint.name}; run predict_stage2 first: {path}")
+    return path
+
+
+def fill_from_run(args, needed):
+    """Fill missing paths from the run's naming conventions."""
+    config = PipelineConfig(batch_id=args.batch_id)
+    if "stage1_checkpoint" in needed and not args.stage1_checkpoint:
+        args.stage1_checkpoint = best_checkpoint(config, "model_stage1", args.modality, args.run_name)
+    if "stage1_features" in needed and not args.stage1_features:
+        args.stage1_features = workflows.default_features_dir(config, args.stage1_checkpoint, args.modality)
+    if "checkpoint" in needed and not args.checkpoint:
+        prefix = "model_stage1" if args.stage == "evaluate_stage1" else "model_final"
+        args.checkpoint = best_checkpoint(config, prefix, args.modality, args.run_name)
+    if "predictions" in needed and not args.predictions:
+        args.predictions = predictions_file(config, args.modality, args.run_name)
+
+
 def resolve_run_inputs(args, parser):
     """Fill the paths a stage needs from --run-name/--modality; explicit paths are kept as given."""
     needed = RUN_INPUTS.get(args.stage)
@@ -47,14 +95,7 @@ def resolve_run_inputs(args, parser):
     if args.run_name:
         if not args.modality:
             parser.error("--modality is required with --run-name")
-        config = PipelineConfig(batch_id=args.batch_id)
-        if "stage1_checkpoint" in needed and not args.stage1_checkpoint:
-            args.stage1_checkpoint = best_checkpoint(config, "model_stage1", args.modality, args.run_name)
-        if "stage1_features" in needed and not args.stage1_features:
-            args.stage1_features = workflows.default_features_dir(config, args.stage1_checkpoint, args.modality)
-        if "checkpoint" in needed and not args.checkpoint:
-            prefix = "model_stage1" if args.stage in ("evaluate_stage1", "predict_stage1") else "model_final"
-            args.checkpoint = best_checkpoint(config, prefix, args.modality, args.run_name)
+        fill_from_run(args, needed)
     missing = [name for name in needed if not getattr(args, name)]
     if missing:
         parser.error("give --run-name and --modality, or " + ", ".join("--" + name.replace("_", "-") for name in missing))
@@ -119,8 +160,8 @@ def build_parser():
     command.add_argument("--checkpoint")
     command.add_argument("--split", choices=["train", "val", "test"], default="test")
     command.add_argument("--output", help="optional; defaults to the batch results folder")
-    command = stage("predict_stage1", batch_size=8); run_lookup(command)
-    command.add_argument("--checkpoint")
+    command = stage("predict_stage1", batch_size=8)
+    command.add_argument("--checkpoint", required=True)
     command.add_argument("--output", help="optional; defaults to the batch results folder")
 
     command = stage("precompute_features", batch_size=8); subset(command); run_lookup(command)
@@ -140,6 +181,15 @@ def build_parser():
     command = stage("predict_stage2"); stage2_inputs(command); run_lookup(command)
     command.add_argument("--checkpoint")
     command.add_argument("--output", help="optional; defaults to the batch results folder")
+
+    command = stage("report", device=False, limit=False); run_lookup(command)
+    command.add_argument("--predictions", help="CSV written by predict_stage1 or predict_stage2")
+    command.add_argument("--split", choices=["train", "val", "test"], default="val")
+    command.add_argument("--level", choices=["page", "document"], default="page",
+                         help="document: pages take the mean probabilities of their predicted document (PnC pooling)")
+    command.add_argument("--thresholds", type=float, nargs="+", default=[0.0, 0.5, 0.6, 0.7, 0.8, 0.9],
+                         help="a page is processed automatically when its highest probability is above the threshold")
+    command.add_argument("--output", help="optional; defaults to the batch results folder")
     return parser
 
 
@@ -155,6 +205,7 @@ STAGES = {
     "train_stage2": workflows.train_stage2,
     "evaluate_stage2": workflows.evaluate_stage2,
     "predict_stage2": workflows.predict_stage2,
+    "report": report,
 }
 
 

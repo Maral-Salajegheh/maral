@@ -1,10 +1,11 @@
-"""Metrics and immutable result writing (counterpart of PnC evaluation.py)."""
+"""Metrics, confidence reports and immutable result writing (counterpart of PnC evaluation.py)."""
 
 import csv
 import json
 from pathlib import Path
 
-from .config import CLASSES, ID_TO_CLASS
+from .config import CLASS_TO_ID, CLASSES, ID_TO_CLASS
+from .data import read_csv
 
 
 def classification_metrics(y_true, y_pred):
@@ -55,6 +56,86 @@ def binary_metrics(y_true, y_pred):
         "support": len(y_true),
     }
 
+
+# ===========================================================================
+# Confidence report (PnC generate_report: confidence threshold, probability pooling)
+# ===========================================================================
+
+def read_predictions(path):
+    """Rows of a predict_stage1/predict_stage2 CSV, ordered by stack and position, with class probabilities."""
+    rows = read_csv(path)
+    for row in rows:
+        row["probs"] = [float(row[f"prob_{label}"]) for label in CLASSES]
+        row["stack_position"] = int(row["stack_position"])
+    return sorted(rows, key=lambda row: (row["stack_id"], row["stack_position"]))
+
+
+def start_probability(row):
+    """Document-start probability; predict_stage2 and predict_stage1 name the column differently."""
+    return float(row.get("document_start_probability") or row["first_page_probability"])
+
+
+def predicted_documents(rows):
+    """Split ordered rows into predicted documents (start probability >= 0.5 is the argmax of the start head)."""
+    documents, current = [], []
+    for row in rows:
+        if current and (row["stack_position"] == 1 or start_probability(row) >= 0.5):
+            documents.append(current)
+            current = []
+        current.append(row)
+    if current:
+        documents.append(current)
+    return documents
+
+
+def pool_documents(rows):
+    """PnC probability pooling: each page takes the mean class probabilities of its predicted document."""
+    pooled = []
+    for document in predicted_documents(rows):
+        mean = [sum(row["probs"][i] for row in document) / len(document) for i in range(len(CLASSES))]
+        pooled += [{**row, "probs": mean} for row in document]
+    return pooled
+
+
+def predicted_id(row):
+    return max(range(len(CLASSES)), key=lambda index: row["probs"][index])
+
+
+def threshold_metrics(rows, threshold):
+    """Metrics for pages processed automatically at a threshold (PnC: highest probability > threshold)."""
+    auto = [row for row in rows if max(row["probs"]) > threshold]
+    truth = [CLASS_TO_ID[row["page_class"]] for row in auto]
+    pred = [predicted_id(row) for row in auto]
+    errors_auto = sum(t != p for t, p in zip(truth, pred))
+    errors_total = sum(CLASS_TO_ID[row["page_class"]] != predicted_id(row) for row in rows)
+    return {"threshold": threshold, "coverage": len(auto) / len(rows) if rows else 0.0,
+            "auto_pages": len(auto), "review_pages": len(rows) - len(auto),
+            "errors_auto": errors_auto, "errors_review": errors_total - errors_auto,
+            "classification": classification_metrics(truth, pred)}
+
+
+def confidence_report(rows, thresholds, level):
+    """One threshold_metrics result per threshold, on page or pooled document probabilities."""
+    rows = pool_documents(rows) if level == "document" else rows
+    return [threshold_metrics(rows, threshold) for threshold in thresholds]
+
+
+def format_confidence_table(results):
+    """Plain-text table: coverage, routed errors and F1 per class for each threshold."""
+    header = ["threshold", "coverage", "auto", "review", "err_auto", "err_review", "macro_f1"] + list(CLASSES)
+    lines = ["  ".join(f"{name:>10}" for name in header)]
+    for result in results:
+        per_class = result["classification"]["per_class"]
+        values = [result["threshold"], result["coverage"], result["auto_pages"], result["review_pages"],
+                  result["errors_auto"], result["errors_review"], result["classification"]["macro_f1"]]
+        values += [per_class[label]["f1"] for label in CLASSES]
+        lines.append("  ".join(f"{value:>10.4f}" if isinstance(value, float) else f"{value:>10}" for value in values))
+    return "\n".join(lines)
+
+
+# ===========================================================================
+# Immutable result writing
+# ===========================================================================
 
 def write_json_new(path: Path, payload):
     path.parent.mkdir(parents=True, exist_ok=True)
