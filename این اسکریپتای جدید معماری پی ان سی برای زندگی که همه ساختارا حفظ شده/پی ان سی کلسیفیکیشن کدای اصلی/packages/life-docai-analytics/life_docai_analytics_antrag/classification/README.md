@@ -50,8 +50,8 @@ Every step needs `--batch-id`: it selects the input data and the output folder
 of that batch, so nothing depends on a built-in default. The dataset report
 records the batch, the split seed and a checksum of every input file, so a run
 can always be traced back to its exact data. Add `--help` to any command to see
-its options. The pipeline has nine executable commands: seven main
-processing/training commands and two optional evaluation commands.
+its options. The pipeline has ten executable commands: seven main
+processing/training commands and three optional evaluation commands.
 
 From step 4 on, every command takes the same `--run-name` and `--modality`. Step 4 uses
 them to name the run; the later steps use them to find the best checkpoint of that run
@@ -93,6 +93,11 @@ and its page features, and write their results to `results/<batch_id>/`.
    ```bash
    PYTHONPATH=packages/life-docai-analytics pixi run -e dev python -m life_docai_analytics_antrag.classification.training.main predict_stage2 --batch-id <batch_id> --run-name <run_name> --modality fusion
    ```
+10. **Confidence report** (optional): reads the predictions from step 9 and shows, for each threshold, how many pages would be processed automatically, how many go to human review, and the errors and F1 scores on the automatic part. A page is processed automatically when its highest class probability is above the threshold. Needs no GPU; writes `report_<split>_<level>_<predictions name>.json`.
+    ```bash
+    PYTHONPATH=packages/life-docai-analytics pixi run -e dev python -m life_docai_analytics_antrag.classification.training.main report --batch-id <batch_id> --run-name <run_name> --modality fusion
+    ```
+    `--level document` uses the mean probabilities of each predicted document (PnC probability pooling) instead of single pages. `--split` (default `val`) and `--thresholds` (default `0.0 0.5 0.6 0.7 0.8 0.9`) can be changed.
 
 Steps 2 and 3 skip pages that are already done, so they can be stopped and
 resumed. Training saves a checkpoint after every epoch and keeps the best one
