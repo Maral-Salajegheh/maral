@@ -93,11 +93,11 @@ and its page features, and write their results to `results/<batch_id>/`.
    ```bash
    PYTHONPATH=packages/life-docai-analytics pixi run -e dev python -m life_docai_analytics_antrag.classification.training.main predict_stage2 --batch-id <batch_id> --run-name <run_name> --modality fusion
    ```
-10. **Confidence report** (optional): reads the predictions from step 9 and shows, for each threshold, how many pages would be processed automatically, how many go to human review, and the errors and F1 scores on the automatic part. A page is processed automatically when its highest class probability is above the threshold. Needs no GPU; writes `report_<split>_<level>_<predictions name>.json`.
+10. **Confidence report** (optional): reads the predictions from step 9 and shows, for each threshold, how many pages would be processed automatically, how many go to human review, and the errors and F1 scores on the automatic part. A page is processed automatically when its highest class probability is above the threshold. Needs no GPU; writes `report_<split>_<level>_<predictions name>.json` and the same table as `.csv`. With `--review-threshold`, also writes `..._review_t<threshold>.csv`: the pages that go to human review at that threshold, least confident first, with empty columns for the reviewer.
     ```bash
-    PYTHONPATH=packages/life-docai-analytics pixi run -e dev python -m life_docai_analytics_antrag.classification.training.main report --batch-id <batch_id> --run-name <run_name> --modality fusion
+    PYTHONPATH=packages/life-docai-analytics pixi run -e dev python -m life_docai_analytics_antrag.classification.training.main report --batch-id <batch_id> --run-name <run_name> --modality fusion --review-threshold 0.8
     ```
-    `--level document` uses the mean probabilities of each predicted document (PnC probability pooling) instead of single pages. `--split` (default `val`) and `--thresholds` (default `0.0 0.5 0.6 0.7 0.8 0.9`) can be changed.
+    `--level document` uses the mean probabilities of each predicted document (PnC probability pooling) instead of single pages. `--split` (default `val`) and `--thresholds` (default `0.0 0.5 0.6 0.7 0.8 0.9`) can be changed. `--confidence-percentile` (as PnC, default `0` = off) keeps that percent of pages with the lowest entropy instead of using the thresholds; its files are named `report_<split>_<level>_p<percentile>_...`.
 
 Steps 2 and 3 skip pages that are already done, so they can be stopped and
 resumed. Training saves a checkpoint after every epoch and keeps the best one

@@ -1,4 +1,3 @@
-
 import argparse
 import json
 from pathlib import Path
@@ -6,7 +5,8 @@ from pathlib import Path
 from . import workflows
 from .config import PipelineConfig
 from .data import _file_record, prepare_model_population, read_csv, split_assignments, split_report
-from .evaluation import confidence_report, format_confidence_table, read_predictions, write_json_new
+from .evaluation import (REVIEW_FIELDS, confidence_report, format_confidence_table, level_rows, read_predictions,
+                         review_rows, summary_rows, write_csv_new, write_json_new)
 
 # Paths each stage needs; filled from --run-name/--modality when not given explicitly.
 RUN_INPUTS = {
@@ -37,18 +37,44 @@ def split_rows(config, predictions, split):
     return rows
 
 
+def report_output(config, args):
+    """JSON path of the report; its CSV summary and review list are written next to it."""
+    if args.output:
+        return Path(args.output)
+    rule = f"_p{args.confidence_percentile:g}" if args.confidence_percentile > 0 else ""
+    return config.results_dir / f"report_{args.split}_{args.level}{rule}_{Path(args.predictions).stem}.json"
+
+
+def report_payload(config, args, rows, results):
+    """Full report with its parameters and the checksums of its inputs."""
+    return {"split": args.split, "level": args.level, "pages": len(rows),
+            "confidence_percentile": args.confidence_percentile, "review_threshold": args.review_threshold,
+            "results": results, "inputs": {"predictions": _file_record(args.predictions),
+                                           "splits": _file_record(config.split_file)}}
+
+
+def write_review(rows, threshold, output):
+    """CSV of the pages a human reviews at the threshold."""
+    queue = review_rows(rows, threshold)
+    path = output.with_name(f"{output.stem}_review_t{threshold:g}.csv")
+    write_csv_new(path, queue, REVIEW_FIELDS)
+    print(f"review: {len(queue)} pages -> {path}")
+
+
 def report(args):
-    """Confidence report on an existing predictions CSV: coverage and metrics per threshold."""
+    """Confidence report on an existing predictions CSV: JSON in full, CSV summary, optional review list."""
     config = PipelineConfig(batch_id=args.batch_id)
-    rows = split_rows(config, args.predictions, args.split)
-    results = confidence_report(rows, args.thresholds, args.level)
-    output = Path(args.output) if args.output else \
-        config.results_dir / f"report_{args.split}_{args.level}_{Path(args.predictions).stem}.json"
-    write_json_new(output, {"split": args.split, "level": args.level, "pages": len(rows), "results": results,
-                            "inputs": {"predictions": _file_record(args.predictions),
-                                       "splits": _file_record(config.split_file)}})
-    print(format_confidence_table(results))
+    rows = level_rows(split_rows(config, args.predictions, args.split), args.level)
+    results = confidence_report(rows, args.thresholds, args.confidence_percentile)
+    output = report_output(config, args)
+    write_json_new(output, report_payload(config, args, rows, results))
+    summary = summary_rows(results)
+    write_csv_new(output.with_suffix(".csv"), summary, list(summary[0]))
+    print(format_confidence_table(summary))
     print(output)
+    print(output.with_suffix(".csv"))
+    if args.review_threshold is not None:
+        write_review(rows, args.review_threshold, output)
 
 
 def best_checkpoint(config, model_prefix, modality, run_name):
@@ -189,6 +215,11 @@ def build_parser():
                          help="document: pages take the mean probabilities of their predicted document (PnC pooling)")
     command.add_argument("--thresholds", type=float, nargs="+", default=[0.0, 0.5, 0.6, 0.7, 0.8, 0.9],
                          help="a page is processed automatically when its highest probability is above the threshold")
+    command.add_argument("--confidence-percentile", type=float, default=0,
+                         help="as PnC: keep this percent of pages with the lowest entropy instead of --thresholds; "
+                              "0 (default) = off")
+    command.add_argument("--review-threshold", type=float,
+                         help="also write a CSV of the pages that go to human review at this threshold")
     command.add_argument("--output", help="optional; defaults to the batch results folder")
     return parser
 

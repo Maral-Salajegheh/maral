@@ -1,7 +1,7 @@
 """Metrics, confidence reports and immutable result writing (counterpart of PnC evaluation.py)."""
-
 import csv
 import json
+import math
 from pathlib import Path
 
 from .config import CLASS_TO_ID, CLASSES, ID_TO_CLASS
@@ -58,8 +58,11 @@ def binary_metrics(y_true, y_pred):
 
 
 # ===========================================================================
-# Confidence report (PnC generate_report: confidence threshold, probability pooling)
+# Confidence report (PnC generate_report: confidence threshold or percentile, probability pooling)
 # ===========================================================================
+
+REVIEW_FIELDS = ["stack_id", "stack_position", "masterindex_id", "pdf_page_number", "image_path", "predicted_class",
+                 "confidence", "second_class", "second_probability", "reviewed_class", "reviewer", "comment"]
 
 def read_predictions(path):
     """Rows of a predict_stage1/predict_stage2 CSV, ordered by stack and position, with class probabilities."""
@@ -97,40 +100,101 @@ def pool_documents(rows):
     return pooled
 
 
+def level_rows(rows, level):
+    """Page probabilities, or each page with the mean probabilities of its predicted document."""
+    return pool_documents(rows) if level == "document" else rows
+
+
 def predicted_id(row):
     return max(range(len(CLASSES)), key=lambda index: row["probs"][index])
 
 
-def threshold_metrics(rows, threshold):
-    """Metrics for pages processed automatically at a threshold (PnC: highest probability > threshold)."""
-    auto = [row for row in rows if max(row["probs"]) > threshold]
+def confidence(row):
+    """Highest class probability (PnC confidence_threshold)."""
+    return max(row["probs"])
+
+
+def entropy(row):
+    """Entropy of the class probabilities (PnC confidence_percentile); low means confident."""
+    return -sum(p * math.log(p + 1e-12) for p in row["probs"])
+
+
+def threshold_auto(rows, threshold):
+    """PnC: a page is processed automatically when its highest probability is above the threshold."""
+    if not 0 <= threshold <= 1:
+        raise ValueError(f"threshold must be between 0 and 1: {threshold}")
+    return [confidence(row) > threshold for row in rows]
+
+
+def percentile_auto(rows, percentile):
+    """PnC: the given percent of pages with the lowest entropy is processed automatically."""
+    if not 0 < percentile <= 100:
+        raise ValueError(f"confidence percentile must be in (0, 100]: {percentile}")
+    keep = int(len(rows) * percentile / 100)
+    chosen = set(sorted(range(len(rows)), key=lambda index: entropy(rows[index]))[:keep])
+    return [index in chosen for index in range(len(rows))]
+
+
+def routing_metrics(rows, auto_flags):
+    """Coverage, errors on the automatic and the reviewed part, and metrics on the automatic part."""
+    auto = [row for row, flag in zip(rows, auto_flags) if flag]
     truth = [CLASS_TO_ID[row["page_class"]] for row in auto]
     pred = [predicted_id(row) for row in auto]
     errors_auto = sum(t != p for t, p in zip(truth, pred))
     errors_total = sum(CLASS_TO_ID[row["page_class"]] != predicted_id(row) for row in rows)
-    return {"threshold": threshold, "coverage": len(auto) / len(rows) if rows else 0.0,
+    return {"coverage": len(auto) / len(rows) if rows else 0.0,
             "auto_pages": len(auto), "review_pages": len(rows) - len(auto),
             "errors_auto": errors_auto, "errors_review": errors_total - errors_auto,
             "classification": classification_metrics(truth, pred)}
 
 
-def confidence_report(rows, thresholds, level):
-    """One threshold_metrics result per threshold, on page or pooled document probabilities."""
-    rows = pool_documents(rows) if level == "document" else rows
-    return [threshold_metrics(rows, threshold) for threshold in thresholds]
+def confidence_report(rows, thresholds, percentile=0):
+    """As PnC: the percentile rule when percentile > 0, otherwise one result per threshold."""
+    if percentile > 0:
+        return [{"percentile": percentile, **routing_metrics(rows, percentile_auto(rows, percentile))}]
+    return [{"threshold": threshold, **routing_metrics(rows, threshold_auto(rows, threshold))} for threshold in thresholds]
 
 
-def format_confidence_table(results):
-    """Plain-text table: coverage, routed errors and F1 per class for each threshold."""
-    header = ["threshold", "coverage", "auto", "review", "err_auto", "err_review", "macro_f1"] + list(CLASSES)
-    lines = ["  ".join(f"{name:>10}" for name in header)]
+def summary_rows(results):
+    """One flat row per threshold (or percentile): the readable form of the report, for the CSV and the table."""
+    rows = []
     for result in results:
+        rule = "percentile" if "percentile" in result else "threshold"
         per_class = result["classification"]["per_class"]
-        values = [result["threshold"], result["coverage"], result["auto_pages"], result["review_pages"],
-                  result["errors_auto"], result["errors_review"], result["classification"]["macro_f1"]]
-        values += [per_class[label]["f1"] for label in CLASSES]
-        lines.append("  ".join(f"{value:>10.4f}" if isinstance(value, float) else f"{value:>10}" for value in values))
+        row = {rule: result[rule], "coverage": round(result["coverage"], 4), "auto": result["auto_pages"],
+               "review": result["review_pages"], "err_auto": result["errors_auto"],
+               "err_review": result["errors_review"], "macro_f1": round(result["classification"]["macro_f1"], 4)}
+        row.update({f"f1_{label}": round(per_class[label]["f1"], 4) for label in CLASSES})
+        rows.append(row)
+    return rows
+
+
+def format_confidence_table(rows):
+    """Plain-text table of summary_rows."""
+    header = list(rows[0])
+    lines = ["  ".join(f"{name:>10}" for name in header)]
+    for row in rows:
+        lines.append("  ".join(f"{row[name]:>10}" for name in header))
     return "\n".join(lines)
+
+
+def review_row(row):
+    """One page for the reviewer: prediction, two most likely classes, empty columns to fill in."""
+    ranked = sorted(range(len(CLASSES)), key=lambda index: -row["probs"][index])
+    return {"stack_id": row["stack_id"], "stack_position": row["stack_position"],
+            "masterindex_id": row["masterindex_id"], "pdf_page_number": row["pdf_page_number"],
+            "image_path": row["page_identity"], "predicted_class": CLASSES[ranked[0]],
+            "confidence": round(row["probs"][ranked[0]], 4), "second_class": CLASSES[ranked[1]],
+            "second_probability": round(row["probs"][ranked[1]], 4),
+            "reviewed_class": "", "reviewer": "", "comment": ""}
+
+
+def review_rows(rows, threshold):
+    """Pages that go to human review at a threshold, least confident first. The true label is left out."""
+    flags = threshold_auto(rows, threshold)
+    queue = [row for row, auto in zip(rows, flags) if not auto]
+    queue.sort(key=lambda row: (confidence(row), row["stack_id"], row["stack_position"]))
+    return [review_row(row) for row in queue]
 
 
 # ===========================================================================
