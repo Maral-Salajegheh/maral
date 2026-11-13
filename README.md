@@ -434,3 +434,6 @@ cd ~/Projects/life-docai && pixi run -e dev python -c "import zxingcpp; print(zx
 
 if error add this
 cd ~/Projects/life-docai && pixi add -e dev --pypi zxing-cpp
+
+
+pixi run -e dev python -c "import zxingcpp; from importlib.metadata import version; print(version('zxing-cpp'))"
