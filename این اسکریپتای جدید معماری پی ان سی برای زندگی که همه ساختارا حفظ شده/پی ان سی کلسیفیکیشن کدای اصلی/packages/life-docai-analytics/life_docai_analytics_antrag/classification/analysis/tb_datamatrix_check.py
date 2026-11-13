@@ -16,13 +16,14 @@ REQUIRED = {ANTRAG, ANGEBOT}
 
 
 def read_chunks(image_paths):
-    """AXA03 chunks of one document: {container: {number: base64}}, {container: total}, Data Matrix count."""
-    chunks, totals, n_datamatrix = {}, {}, 0
+    """AXA03 chunks of one document: {container: {number: base64}}, {container: total}, Data Matrix count per page."""
+    chunks, totals, page_counts = {}, {}, []
     for path in image_paths:
         with Image.open(path) as image:
             gray = np.array(image.convert("L"))
-        for code in zxingcpp.read_barcodes(gray, formats=zxingcpp.BarcodeFormat.DataMatrix):
-            n_datamatrix += 1
+        codes = zxingcpp.read_barcodes(gray, formats=zxingcpp.BarcodeFormat.DataMatrix)
+        page_counts.append(len(codes))
+        for code in codes:
             text = code.text
             if not text.startswith(HEADER):
                 continue  # e.g. the small page-id Data Matrix
@@ -31,7 +32,7 @@ def read_chunks(image_paths):
                 continue
             chunks.setdefault(container, {})[number] = value
             totals[container] = int(total)
-    return chunks, totals, n_datamatrix
+    return chunks, totals, page_counts
 
 
 def derived_class(complete):
@@ -46,7 +47,7 @@ def derived_class(complete):
 
 
 def technikblatt_status(image_paths):
-    chunks, totals, n_datamatrix = read_chunks(image_paths)
+    chunks, totals, page_counts = read_chunks(image_paths)
     complete = {c for c in chunks if len(chunks[c]) == totals[c]}
     payloads = {}
     for container in complete:
@@ -56,7 +57,8 @@ def technikblatt_status(image_paths):
         except (ValueError, OSError):
             payloads[container] = None
     return {
-        "n_datamatrix": n_datamatrix,
+        "n_datamatrix": sum(page_counts),
+        "page_datamatrix": " ".join(map(str, page_counts)),  # 0 on a page = probably not a Technikblatt image
         "n_axa03": sum(len(v) for v in chunks.values()),
         "complete": " ".join(sorted(complete)),
         "missing_chunks": " ".join(f"{c}:{totals[c] - len(chunks[c])}" for c in sorted(chunks) if c not in complete),
@@ -129,11 +131,23 @@ def main():
         if number % 50 == 0:
             print(f"{number}/{len(keys)} documents")
 
+    pd.set_option("display.max_columns", None)
+    pd.set_option("display.width", 250)
     result = pd.DataFrame(results)
     result.to_csv(args.output, index=False)
     print(f"documents: {len(result)}  broken: {result['broken'].mean():.3f}  match_sfdoc_class: {result['match'].mean():.3f}")
     print(pd.crosstab(result["sfdoc_class"], result["derived_class"]))
+
+    mismatches = result[~result["match"]]
+    columns = ["stack_id", "doc_idx", "tb_pages", "sfdoc_class", "n_datamatrix", "page_datamatrix", "n_axa03",
+               "complete", "missing_chunks", "derived_class"]
+    print(f"\nmismatches: {len(mismatches)}")
+    if len(mismatches):
+        print(mismatches[columns].to_string(index=False))
+    mismatch_path = Path(args.output).with_name(f"{Path(args.output).stem}_mismatches.csv")
+    mismatches.to_csv(mismatch_path, index=False)
     print(args.output)
+    print(mismatch_path)
 
 
 if __name__ == "__main__":
