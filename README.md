@@ -304,3 +304,133 @@ if predicted_mad:
     ))
 print("Saved:", output.resolve())
 PY
+
+
+
+
+
+python3 -c '
+import json, sys
+a, b = (json.load(open(p)) for p in sys.argv[1:3])
+for k in ["analyse_db_rows", "stacks_total", "stacks_used", "pages_used",
+          "pages_excluded", "documents", "pages_on_fallback_key",
+          "first_page_labels_changed_vs_mapping",
+          "rendered_pages_without_row_in_used_mids"]:
+    print(f"{k:42s} {str(a.get(k)):>10} -> {str(b.get(k)):>10}")
+for section in ["page_class_counts", "stacks_excluded"]:
+    print(f"\n{section}")
+    x, y = a.get(section, {}), b.get(section, {})
+    for key in sorted(set(x) | set(y)):
+        print(f"  {key:28s} {x.get(key,0):>9} -> {y.get(key,0):>9}")
+' classification/output/antrag_life_A00_G07_MAD/stack_population_report_v1.json classification/output/antrag_life_A00_G07_MAD/stack_population_report.json
+
+
+
+
+
+
+
+
+##fals negative mad
+cd ~/Projects/life-docai
+
+pixi run -e dev python - <<'PY'
+import csv
+from collections import Counter
+from datetime import datetime
+from pathlib import Path
+
+root = Path("packages/life-docai-analytics/life_docai_analytics_antrag/classification")
+batch = "antrag_life_A00_G07_MAD"
+data_dir = root / "output" / batch
+results_dir = root / "results" / batch
+
+prediction = results_dir / "predictions_final_model_final_fusion_mapping_v2_best_epoch_000.csv"
+
+with (data_dir / "stack_splits.csv").open(
+    newline="", encoding="utf-8-sig"
+) as f:
+    test_stacks = {
+        r["stack_id"] for r in csv.DictReader(f)
+        if r["split"] == "test"
+    }
+
+errors = {}
+actual_mad = 0
+true_positive = 0
+
+with prediction.open(newline="", encoding="utf-8-sig") as f:
+    for r in csv.DictReader(f):
+        if r["stack_id"] not in test_stacks:
+            continue
+        if r["page_class"].strip() == "MAD":
+            actual_mad += 1
+            if r["predicted_class"].strip() == "MAD":
+                true_positive += 1
+            else:
+                identity = r["page_identity"]
+                if identity in errors:
+                    raise ValueError(f"Duplicate page_identity: {identity}")
+                errors[identity] = r
+
+fields = [
+    "stack_id", "masterindex_id", "process_id", "doc_id",
+    "subdoc_idx", "image_id", "stack_position", "pdf_page_number",
+    "sfdoc_class", "page_class", "predicted_class",
+    "training_label_quality", "image_path",
+]
+
+stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+output = prediction.with_name(
+    prediction.stem + f"_MAD_FN_test_{stamp}.csv"
+)
+
+counts = Counter(r["predicted_class"].strip() for r in errors.values())
+matched = set()
+
+with (data_dir / "stack_pages.csv").open(
+    newline="", encoding="utf-8-sig"
+) as source, output.open(
+    "x", newline="", encoding="utf-8-sig"
+) as target:
+    writer = csv.DictWriter(target, fieldnames=fields)
+    writer.writeheader()
+
+    for r in csv.DictReader(source):
+        identity = r["page_identity"]
+        if identity not in errors:
+            continue
+        pred = errors[identity]
+        record = {key: r.get(key, "") for key in fields}
+        record["page_class"] = pred["page_class"]
+        record["predicted_class"] = pred["predicted_class"]
+        writer.writerow(record)
+        matched.add(identity)
+
+print("Prediction:", prediction.name)
+print("Actual MAD in test:", actual_mad)
+print("Correctly predicted MAD:", true_positive)
+print("MAD false negatives in test:", len(errors))
+print("Predicted instead as:", dict(counts))
+print("Matched pages:", len(matched))
+if actual_mad:
+    print("MAD recall: {:.2%}".format(true_positive / actual_mad))
+if len(matched) != len(errors):
+    print("WARNING: Some pages were not found in stack_pages.csv.")
+print("Saved:", output.resolve())
+PY
+
+
+
+
+
+
+cd ~/Projects/life-docai && mkdir -p packages/life-docai-analytics/life_docai_analytics_antrag/classification/results/antrag_life_A00_G07_MAD/tb_check && pixi run -e dev python packages/life-docai-analytics/life_docai_analytics_antrag/classification/analysis/tb_datamatrix_check.py --pages-csv packages/life-docai-analytics/life_docai_analytics_antrag/classification/output/antrag_life_A00_G07_MAD/stack_pages.csv --render-root packages/life-docai-analytics/life_docai_analytics_antrag/datasets/aws_download_ingestion --limit-docs 300 --payload-dir packages/life-docai-analytics/life_docai_analytics_antrag/classification/results/antrag_life_A00_G07_MAD/tb_check/payloads --output packages/life-docai-analytics/life_docai_analytics_antrag/classification/results/antrag_life_A00_G07_MAD/tb_check/tb_check_labels.csv
+
+
+check before run
+cd ~/Projects/life-docai && pixi run -e dev python -c "import zxingcpp; print(zxingcpp.__version__)"
+
+
+if error add this
+cd ~/Projects/life-docai && pixi add -e dev --pypi zxing-cpp
