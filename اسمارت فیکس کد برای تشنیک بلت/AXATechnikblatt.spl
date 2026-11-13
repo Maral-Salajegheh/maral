@@ -1,0 +1,335 @@
+/*******************************************************************************
+  serviceeuemigr 06.10.2014
+*******************************************************************************/
+FUNCTION tbSplitPhoneNumbers(predialField, numberField)
+{
+    extracted := eliminateSpaces(*predialField);
+
+    IF extracted = '' THEN RETURN;
+
+    numbers := STRING_TO_VECTOR(extracted, '-');
+    *predialField := numbers[0];
+
+    IF NOT VERIFIED(*numberField) AND 1 IN numbers THEN
+        *numberField := numbers[1];
+}
+
+/*******************************************************************************
+  ab hier geplant für E2 (R1504)
+  CODE für das Auslesen, Zusammenführen und Dekodieren von gezippten Datamatrizen
+    Diese beinhalten die Daten des Technikblattes
+*******************************************************************************/
+
+/*******************************************************************************
+  MH / TK 18.09.2014
+*******************************************************************************/
+FUNCTION tbProcessBtDatamatrix()
+{
+    IF NOT FIELD_EXISTS(fnGetDM1()) THEN RETURN;
+
+    field := FIELD(fnGetDM1());
+
+    IF *field = '' THEN RETURN;
+
+    tbDmToStringByHeader(field);
+}
+
+/*******************************************************************************
+  serviceeuekomo 24.09.2014
+  parst alle Datamatrizen und gibt alle vollständigen Container als Dict zurück
+*******************************************************************************/
+FUNCTION tbDmToStringByHeader(field)
+{
+    sort := DICT();
+    strDict := DICT();
+    total := DICT();
+
+    fieldDMSet := PATTERN_ALT_SET(*field);
+    rememberedDMSet := admGetRememberedDMForDocFromFile();
+    admCompareSavedDM(fieldDMSet, rememberedDMSet);
+
+    datamatrixSet := IF(admIsDMOcrForTechnikblattEnabled() AND SIZE(rememberedDMSet) > 0, rememberedDMSet, fieldDMSet);
+    FOR dm IN datamatrixSet
+    {
+        dmSplit := tbSplitDatamatrix(dm);
+
+        IF SIZE(dmSplit) = 4 THEN
+        {
+            container := dmSplit['conid'];
+            sort[container][dmSplit['number']] := dmSplit['value'];
+            total[container] := dmSplit['total'];
+        }
+    }
+
+    validContainer := SET();
+
+    FOR container IN sort
+    {
+        IF SIZE(sort[container]) = NUM(total[container]) THEN
+        {
+            validContainer[container] := '';
+            str := '';
+
+            FOR i IN sort[container]
+            {
+                str := str & sort[container][i];
+            }
+            strDict[container] := str;
+        }
+    }
+
+    tbCheckDocClassForContainer(validContainer);
+    tbWriteDatamatrixToFile(strDict);
+}
+
+/*******************************************************************************
+  serviceeuekomo 03.03.2015
+  Update: Frank Weber, Annika Kröger-Reiding 09.05.2019
+  100 Partner
+  101 Zusatz
+  102 Antrag - Policierungsdaten
+  103 Angebot - Tarifierungsdaten
+*******************************************************************************/
+FUNCTION tbCheckDocClassForContainer(validContainer)
+{
+    IF FIND(DOCCLASS(),'Technikblatt') >= 0 THEN
+    {
+        IF NOT tbIsValidTechnikblatt(validContainer) THEN
+        {
+            tbSetDocComment();
+            tbReanalyse(dcGetBestand());
+            RETURN;
+        }
+
+        IF tbIsZusatzContainerMissing(validContainer) THEN
+        {
+            tbReanalyse(dcGetAntragTechnikblattPartnerUndAntragsdaten());
+            RETURN;
+        }
+
+        IF tbIsPartnerContainerMissing(validContainer) THEN
+        {
+            tbReanalyse(dcGetAntragTechnikblattPartnerdaten());
+            RETURN;
+        }
+    }
+}
+
+/*******************************************************************************
+  Frank Weber, Annika Kröger-Reiding 09.05.2019
+  Martin Hannappel 17.01.2020: Nach Klärung mit Andreas Wolfram sind beide
+  Container zwingend erforderlich
+*******************************************************************************/
+FUNCTION tbIsValidTechnikblatt(validContainer)
+{
+    antragsContainer := '0000000102';
+    angebotsContainer := '0000000103';
+
+    RETURN antragsContainer IN validContainer AND angebotsContainer IN validContainer;
+}
+
+/*******************************************************************************
+  Frank Weber, Annika Kröger-Reiding 09.05.2019
+*******************************************************************************/
+FUNCTION tbIsZusatzContainerMissing(validContainer)
+{
+    zusatzContainer := '0000000101';
+
+    RETURN NOT zusatzContainer IN validContainer ;
+}
+
+/*******************************************************************************
+  Frank Weber, Annika Kröger-Reiding 09.05.2019
+*******************************************************************************/
+FUNCTION tbIsPartnerContainerMissing(validContainer)
+{
+    partnerContainer := '0000000100';
+
+    RETURN NOT partnerContainer IN validContainer ;
+}
+
+/*******************************************************************************
+  serviceeuekomo 03.03.2015
+*******************************************************************************/
+FUNCTION tbReanalyse(class)
+{
+    REANALYSE(class);
+}
+
+/*******************************************************************************
+  serviceeuekomo 24.03.2015
+*******************************************************************************/
+FUNCTION tbSetDocComment()
+{
+    newComment := toolsConcatComments(DOC_COMMENT(-1), 'Datamatrix fehlt / defekt, bitte als Bestand (AME,AMD,AMB,...) weitergeben. ');
+    SETDOC_COMMENT(-1, newComment);
+}
+
+/*******************************************************************************
+  serviceeuekomo 24.09.2014
+  Aufbau der Datamatrizen
+    AXA{Version=03}{ContainerID(10St)}{DataMatrixNr(3St)}{DataMatrixGesamt(3St)}{Inhalt(BASE64codiert)}
+  Beispiel
+    AXA 03          1234567890         003                016                    ABCDEFGHIJKLMNOP
+*******************************************************************************/
+FUNCTION tbSplitDatamatrix(dm)
+{
+    IF NOT tbIsDatamatrixWithBtHeader(dm) THEN
+        RETURN DICT();
+
+    conidStart := 5;
+    conidLen := 10;
+    numberStart := conidStart + conidLen;
+    numberLen := 3;
+    totalStart := numberStart + numberLen;
+    totalLen := 3;
+    valueStart := totalStart + totalLen;
+    valueLen := 9999;
+
+    dmDict := DICT(
+        'conid' -> SUBSTR(dm, conidStart, conidLen),
+        'number' -> SUBSTR(dm, numberStart, numberLen),
+        'total' -> SUBSTR(dm, totalStart, totalLen),
+        'value' -> SUBSTR(dm, valueStart, valueLen)
+    );
+
+    RETURN dmDict;
+}
+
+/*******************************************************************************
+  serviceeuekomo 24.09.2014
+*******************************************************************************/
+FUNCTION tbIsDatamatrixWithBtHeader(dm)
+{
+    RETURN SUBSTR(dm, 0, 5) = 'AXA03';
+}
+
+/*******************************************************************************
+  serviceeuekomo 24.09.2014
+  Speichern der ausgelesenen Daten binär als gzip
+*******************************************************************************/
+FUNCTION tbWriteDatamatrixToFile(strDict)
+{
+    IF NOT FIELD_EXISTS(fnGetContainerID()) THEN RETURN;
+
+    emptyContainerTable();
+
+    FOR conid IN strDict
+    {
+        fillContainerIntoTable(conid, strDict[conid]);
+    }
+}
+
+/*******************************************************************************
+  i003409A 03.03.2015
+  * Änderung:
+    eigentlich sollte nur der Pfad zur *.gz in die Spalte ConPath geschrieben werden,
+    wegen Firewallbeschränkung in InputTransform wir nun der ganze Base64 String übergeben
+*******************************************************************************/
+FUNCTION fillContainerIntoTable(containerID, gzPath)
+{
+    INSERT_LINE(fnGetContainerTableName(), NUM_LINES(fnGetContainerTableName()));
+    CELL(*FIELD(fnGetContainerID()), NUM_LINES(fnGetContainerTableName())-1) := containerID;
+    CELL(*FIELD(fnGetContainerPath()), NUM_LINES(fnGetContainerTableName())-1) := gzPath;
+}
+
+/*******************************************************************************
+  i003409A 03.03.2015
+*******************************************************************************/
+FUNCTION emptyContainerTable()
+{
+    CLEAR_TABLE(fnGetContainerTableName());
+}
+
+/*******************************************************************************
+  Volmer 03.12.2015
+*******************************************************************************/
+FUNCTION tbFillDunkelausstieg()
+{
+    schluessel := '';
+
+    FOR field IN FIELDS()
+    {
+        IF SUBSTR(NAME(*field),0,3) = 'DU_' THEN
+        {
+            IF FIELD_EXISTS(NAME(*field)) THEN
+            {
+                result := DICT();
+
+                result := dbGetSchluesselDunkelausstiegTable(SUBSTR(NAME(*field),3,40));
+
+                IF SIZE(result) > 0 THEN
+                {
+                    schluessel := result[0];
+                    schluessel := schluessel['SCHLUESSEL'];
+                    schluesselName := NAME(*field) & '_S';
+                    *FIELD(schluesselName) := schluessel;
+                }
+            }
+        }
+    }
+    RETURN;
+}
+
+/*******************************************************************************
+  Lena Feiter, Eva Volmer, Frank Weber 13.03.2019
+*******************************************************************************/
+FUNCTION tbSetTechnikblattToAnalyser()
+{
+    FOR docIDx := 0 TO NUM_DOCS()-1
+    {
+        FOR subDocIDx := 0 TO NUM_DOCCLASSES(docIDx)-1
+        {
+            IF DOCCLASS(docIDx, subDocIDx) = dcGetAntragTechnikblattManuell() AND DOC_CREATED_BY_USER(docIDx) THEN
+            {
+                SETDOC_STATE(docIDx, 'ANALYSER', 'ANALYSE_WITHOUT_CLASSIFICATION');
+                tbCreateMessageStackRevoked();
+            }
+        }
+    }
+}
+
+/*******************************************************************************
+  Lena Feiter, Annika Kroeger-Reiding 15.03.2019
+*******************************************************************************/
+FUNCTION tbCreateMessageStackRevoked()
+{
+    MESSAGE('Message', 'Stapel entzogen', 'Bitte schließen Sie die nachfolgende Ansicht mit F4.', 'OK');
+}
+
+/*******************************************************************************
+  David Müller 22.03.2019
+*******************************************************************************/
+FUNCTION tbReclassifyTechnikblattManuell()
+{
+    IF DOCCLASS() = dcGetAntragTechnikblattManuell() THEN
+        REANALYSE(dcGetAntragTechnikblatt());
+}
+
+/*******************************************************************************
+  Alex Voß 31.08.2023
+*******************************************************************************/
+FUNCTION tbSetZahlweg()
+{
+    IF FIND(DOCCLASS(-1), 'Antrag/Technikblatt Partner') <> -1 AND FIELD_EXISTS(fnGetZahlweg(), -1) AND NOT VERIFIED(*FIELD(fnGetZahlweg(), -1)) THEN
+    {
+        IF toolsDocClassExistsInProcess('MAD/Mandat_') THEN
+            *FIELD(fnGetZahlweg(),-1) := 'LU';
+        ELSE
+            *FIELD(fnGetZahlweg(),-1) := 'RS';
+    }
+}
+
+/*******************************************************************************
+  Oliver Korff 19.02.2026
+  Ist nötig, weil vorher in System der StackState neu berechnet wird und das TB ohne Felder sonst direkt in den Exporter geht.
+*******************************************************************************/
+FUNCTION tbSetDocToAnalyserIfTechnikblatt()
+{
+    docIDx := DOC_INDEX();
+    IF docIDx = -1 THEN
+        RETURN;
+
+    IF DOCCLASS(docIDx) = dcGetAntragTechnikblattManuell() THEN
+        SETDOC_STATE(docIDx, 'ANALYSER', SET('ANALYSE_WITHOUT_CLASSIFICATION'));
+}
