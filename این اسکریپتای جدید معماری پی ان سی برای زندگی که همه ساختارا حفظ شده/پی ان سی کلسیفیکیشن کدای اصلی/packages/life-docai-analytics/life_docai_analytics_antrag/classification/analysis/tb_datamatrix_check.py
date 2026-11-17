@@ -8,7 +8,6 @@ import numpy as np
 import pandas as pd
 import zxingcpp
 from PIL import Image, ImageFilter, ImageOps
-from pylibdmtx import pylibdmtx
 
 from ..training.config import PipelineConfig
 
@@ -28,13 +27,12 @@ def zxing_texts(image):
     return [code.text for code in zxingcpp.read_barcodes(image, formats=zxingcpp.BarcodeFormat.DataMatrix)]
 
 
-def fallback_texts(image, dmtx_timeout):
-    """zxing on a contrast-stretched, a sharpened and a 2x upscaled copy of the page, then libdmtx."""
+def fallback_texts(image):
+    """zxing on a contrast-stretched, a sharpened and a 2x upscaled copy of the page."""
     variants = (ImageOps.autocontrast(image, cutoff=1),
                 image.filter(ImageFilter.UnsharpMask(radius=2, percent=200, threshold=0)),
                 image.resize((image.width * 2, image.height * 2), Image.Resampling.LANCZOS))
-    texts = [text for variant in variants for text in zxing_texts(variant)]
-    return texts + [result.data.decode("latin-1") for result in pylibdmtx.decode(image, timeout=dmtx_timeout)]
+    return [text for variant in variants for text in zxing_texts(variant)]
 
 
 def read_chunks(page_texts):
@@ -54,14 +52,14 @@ def complete_containers(chunks, totals):
     return {c for c in chunks if len(chunks[c]) == totals[c]}
 
 
-def decode_document(images, dmtx_timeout):
+def decode_document(images):
     """zxing; if a chunk is missing, the fallback texts are added (merged, so the fallback never loses a code)."""
     page_texts = [zxing_texts(image) for image in images]
     chunks, totals, _ = read_chunks(page_texts)
     complete = complete_containers(chunks, totals)
     fallback = not REQUIRED <= complete or complete != set(chunks)
     if fallback:
-        page_texts = [texts + fallback_texts(image, dmtx_timeout) for texts, image in zip(page_texts, images)]
+        page_texts = [texts + fallback_texts(image) for texts, image in zip(page_texts, images)]
     return [list(dict.fromkeys(texts)) for texts in page_texts], fallback, not REQUIRED <= complete
 
 
@@ -84,8 +82,8 @@ def payload(chunks, container):
         return None
 
 
-def technikblatt_status(images, dmtx_timeout):
-    page_texts, fallback, broken_before = decode_document(images, dmtx_timeout)
+def technikblatt_status(images):
+    page_texts, fallback, broken_before = decode_document(images)
     chunks, totals, other = read_chunks(page_texts)
     complete = complete_containers(chunks, totals)
     payloads = {container: payload(chunks, container) for container in complete}
@@ -139,7 +137,7 @@ def check_documents(tb_docs, keys, config, args, payload_dir):
     for number, (stack_id, doc_idx) in enumerate(keys, start=1):
         doc = tb_docs.get_group((stack_id, doc_idx))
         images = [load_gray(config.render_root / path) for path in doc["image_path"]]
-        status, payloads = technikblatt_status(images, args.dmtx_timeout)
+        status, payloads = technikblatt_status(images)
         sfdoc_class = doc["sfdoc_class"].dropna().iloc[0] if doc["sfdoc_class"].notna().any() else ""
         results.append({"stack_id": stack_id, "doc_idx": doc_idx, "tb_pages": len(doc), "sfdoc_class": sfdoc_class,
                         **status, "match": status["derived_class"] == sfdoc_class})
@@ -180,7 +178,6 @@ def main():
     parser.add_argument("--predictions", help="predict_stage1/2 CSV (production view); without it doc_id from the mapping groups the pages")
     parser.add_argument("--limit-docs", type=int, help="random sample of Technikblatt documents")
     parser.add_argument("--seed", type=int, default=13)
-    parser.add_argument("--dmtx-timeout", type=int, default=5000, help="libdmtx time limit per page in ms (fallback only)")
     parser.add_argument("--save-payloads", action="store_true", help="write decoded container payloads for inspection")
     args = parser.parse_args()
 
