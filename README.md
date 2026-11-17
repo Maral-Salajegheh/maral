@@ -437,3 +437,6 @@ cd ~/Projects/life-docai && pixi add -e dev --pypi zxing-cpp
 
 
 pixi run -e dev python -c "import zxingcpp; from importlib.metadata import version; print(version('zxing-cpp'))"
+
+
+pixi run -e dev python -m life_docai_analytics_antrag.classification.analysis.tb_datamatrix_check --batch-id antrag_life_A00_G07_MAD --limit-docs 300
