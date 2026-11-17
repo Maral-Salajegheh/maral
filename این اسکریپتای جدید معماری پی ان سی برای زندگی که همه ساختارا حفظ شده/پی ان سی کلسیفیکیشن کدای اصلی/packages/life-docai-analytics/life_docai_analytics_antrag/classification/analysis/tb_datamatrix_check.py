@@ -3,36 +3,66 @@
 import argparse
 import base64
 import gzip
-from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import zxingcpp
-from PIL import Image
+from PIL import Image, ImageFilter, ImageOps
+from pylibdmtx import pylibdmtx
+
+from ..training.config import PipelineConfig
 
 HEADER = "AXA03"
 PARTNER, ZUSATZ, ANTRAG, ANGEBOT = "0000000100", "0000000101", "0000000102", "0000000103"
 REQUIRED = {ANTRAG, ANGEBOT}
+KNOWN = {PARTNER, ZUSATZ, ANTRAG, ANGEBOT}
+DOCUMENT_KEY = ["stack_id", "masterindex_id", "process_id", "doc_id", "subdoc_idx"]
 
 
-def read_chunks(image_paths):
-    """AXA03 chunks of one document: {container: {number: base64}}, {container: total}, Data Matrix count per page."""
-    chunks, totals, page_counts = {}, {}, []
-    for path in image_paths:
-        with Image.open(path) as image:
-            gray = np.array(image.convert("L"))
-        codes = zxingcpp.read_barcodes(gray, formats=zxingcpp.BarcodeFormat.DataMatrix)
-        page_counts.append(len(codes))
-        for code in codes:
-            text = code.text
-            if not text.startswith(HEADER):
-                continue  # e.g. the small page-id Data Matrix
-            container, number, total, value = text[5:15], text[15:18], text[18:21], text[21:]
-            if not total.isdigit():
-                continue
-            chunks.setdefault(container, {})[number] = value
-            totals[container] = int(total)
-    return chunks, totals, page_counts
+def load_gray(path):
+    with Image.open(path) as image:
+        return image.convert("L")
+
+
+def zxing_texts(image):
+    return [code.text for code in zxingcpp.read_barcodes(image, formats=zxingcpp.BarcodeFormat.DataMatrix)]
+
+
+def fallback_texts(image, dmtx_timeout):
+    """zxing on a contrast-stretched, a sharpened and a 2x upscaled copy of the page, then libdmtx."""
+    variants = (ImageOps.autocontrast(image, cutoff=1),
+                image.filter(ImageFilter.UnsharpMask(radius=2, percent=200, threshold=0)),
+                image.resize((image.width * 2, image.height * 2), Image.Resampling.LANCZOS))
+    texts = [text for variant in variants for text in zxing_texts(variant)]
+    return texts + [result.data.decode("latin-1") for result in pylibdmtx.decode(image, timeout=dmtx_timeout)]
+
+
+def read_chunks(page_texts):
+    """AXA03 chunks {container: {number: base64}}, chunk totals and the texts of the other Data Matrices."""
+    chunks, totals, other = {}, {}, []
+    for text in (text for texts in page_texts for text in texts):
+        container, number, total, value = text[5:15], text[15:18], text[18:21], text[21:]
+        if not text.startswith(HEADER) or not total.isdigit():
+            other.append(text[:80])  # e.g. the small page-id Data Matrix
+            continue
+        chunks.setdefault(container, {})[number] = value
+        totals[container] = int(total)
+    return chunks, totals, other
+
+
+def complete_containers(chunks, totals):
+    return {c for c in chunks if len(chunks[c]) == totals[c]}
+
+
+def decode_document(images, dmtx_timeout):
+    """zxing; if a chunk is missing, the fallback texts are added (merged, so the fallback never loses a code)."""
+    page_texts = [zxing_texts(image) for image in images]
+    chunks, totals, _ = read_chunks(page_texts)
+    complete = complete_containers(chunks, totals)
+    fallback = not REQUIRED <= complete or complete != set(chunks)
+    if fallback:
+        page_texts = [texts + fallback_texts(image, dmtx_timeout) for texts, image in zip(page_texts, images)]
+    return [list(dict.fromkeys(texts)) for texts in page_texts], fallback, not REQUIRED <= complete
 
 
 def derived_class(complete):
@@ -46,32 +76,40 @@ def derived_class(complete):
     return "Antrag/Technikblatt"
 
 
-def technikblatt_status(image_paths):
-    chunks, totals, page_counts = read_chunks(image_paths)
-    complete = {c for c in chunks if len(chunks[c]) == totals[c]}
-    payloads = {}
-    for container in complete:
-        joined = "".join(chunks[container][n] for n in sorted(chunks[container]))
-        try:
-            payloads[container] = gzip.decompress(base64.b64decode(joined))
-        except (ValueError, OSError):
-            payloads[container] = None
+def payload(chunks, container):
+    joined = "".join(chunks[container][n] for n in sorted(chunks[container]))
+    try:
+        return gzip.decompress(base64.b64decode(joined))
+    except (ValueError, OSError):
+        return None
+
+
+def technikblatt_status(images, dmtx_timeout):
+    page_texts, fallback, broken_before = decode_document(images, dmtx_timeout)
+    chunks, totals, other = read_chunks(page_texts)
+    complete = complete_containers(chunks, totals)
+    payloads = {container: payload(chunks, container) for container in complete}
+    page_counts = [len(texts) for texts in page_texts]
     return {
         "n_datamatrix": sum(page_counts),
         "page_datamatrix": " ".join(map(str, page_counts)),  # 0 on a page = probably not a Technikblatt image
         "n_axa03": sum(len(v) for v in chunks.values()),
+        "containers": " ".join(sorted(chunks)),
         "complete": " ".join(sorted(complete)),
         "missing_chunks": " ".join(f"{c}:{totals[c] - len(chunks[c])}" for c in sorted(chunks) if c not in complete),
         "undecodable": " ".join(sorted(c for c, p in payloads.items() if p is None)),
+        "fallback": fallback,
+        "broken_before_fallback": broken_before,
         "broken": not REQUIRED <= complete,
         "derived_class": derived_class(complete),
+        "other_datamatrix": " | ".join(other),
     }, payloads
 
 
 def documents_from_labels(pages):
-    """True document boundaries and true page classes from stack_pages.csv."""
+    """Documents as the mapping defines them (doc_id), also when their pages are not consecutive in image_id order."""
     pages = pages.sort_values(["stack_id", "stack_position"]).copy()
-    pages["doc_idx"] = pages.groupby("stack_id")["segmentation_target"].cumsum()
+    pages["doc_idx"] = pages.groupby(DOCUMENT_KEY, sort=False).ngroup()
     pages["is_tb"] = pages["page_class"] == "TB0"
     return pages
 
@@ -88,66 +126,74 @@ def documents_from_predictions(predictions, pages):
     return predictions.merge(labels, on="image_path", how="left")
 
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--pages-csv", required=True, help="stack_pages.csv of the batch")
-    parser.add_argument("--render-root", required=True, help="folder that image_path is relative to (config.render_root)")
-    parser.add_argument("--predictions", help="predict_stage1/2 CSV; without it true page classes and boundaries are used")
-    parser.add_argument("--limit-docs", type=int, help="random sample of Technikblatt documents")
-    parser.add_argument("--seed", type=int, default=13)
-    parser.add_argument("--payload-dir", help="optional: write decoded container payloads here for inspection")
-    parser.add_argument("--output", required=True, help="result CSV, one row per Technikblatt document")
-    args = parser.parse_args()
-
-    pages = pd.read_csv(args.pages_csv)
-    if args.predictions:
-        rows = documents_from_predictions(pd.read_csv(args.predictions), pages)
-    else:
-        rows = documents_from_labels(pages)
-
+def select_documents(rows, limit_docs, seed):
     tb_docs = rows[rows["is_tb"]].groupby(["stack_id", "doc_idx"])
     keys = list(tb_docs.groups)
-    if args.limit_docs and args.limit_docs < len(keys):
-        rng = np.random.default_rng(args.seed)
-        keys = [keys[i] for i in rng.choice(len(keys), args.limit_docs, replace=False)]
+    if limit_docs and limit_docs < len(keys):
+        keys = [keys[i] for i in np.random.default_rng(seed).choice(len(keys), limit_docs, replace=False)]
+    return tb_docs, keys
 
-    render_root = Path(args.render_root)
-    payload_dir = Path(args.payload_dir) if args.payload_dir else None
-    if payload_dir:
-        payload_dir.mkdir(parents=True, exist_ok=True)
 
+def check_documents(tb_docs, keys, config, args, payload_dir):
     results = []
     for number, (stack_id, doc_idx) in enumerate(keys, start=1):
         doc = tb_docs.get_group((stack_id, doc_idx))
-        status, payloads = technikblatt_status([render_root / p for p in doc["image_path"]])
+        images = [load_gray(config.render_root / path) for path in doc["image_path"]]
+        status, payloads = technikblatt_status(images, args.dmtx_timeout)
         sfdoc_class = doc["sfdoc_class"].dropna().iloc[0] if doc["sfdoc_class"].notna().any() else ""
-        results.append({"stack_id": stack_id, "doc_idx": doc_idx, "tb_pages": len(doc),
-                        "sfdoc_class": sfdoc_class, **status,
-                        "match": status["derived_class"] == sfdoc_class})
-        if payload_dir:
-            for container, payload in payloads.items():
-                if payload is not None:
-                    (payload_dir / f"{stack_id}_{doc_idx}_{container}.bin").write_bytes(payload)
+        results.append({"stack_id": stack_id, "doc_idx": doc_idx, "tb_pages": len(doc), "sfdoc_class": sfdoc_class,
+                        **status, "match": status["derived_class"] == sfdoc_class})
+        for container, data in payloads.items():
+            if args.save_payloads and data is not None:
+                (payload_dir / f"{stack_id}_{doc_idx}_{container}.bin").write_bytes(data)
         if number % 50 == 0:
             print(f"{number}/{len(keys)} documents")
+    return pd.DataFrame(results)
 
+
+def report(result, output):
     pd.set_option("display.max_columns", None)
     pd.set_option("display.width", 250)
-    result = pd.DataFrame(results)
-    result.to_csv(args.output, index=False)
+    result.to_csv(output, index=False)
+    rescued = result["broken_before_fallback"] & ~result["broken"]
     print(f"documents: {len(result)}  broken: {result['broken'].mean():.3f}  match_sfdoc_class: {result['match'].mean():.3f}")
+    print(f"fallback used: {result['fallback'].sum()}  rescued (broken -> not broken): {rescued.sum()}")
     print(pd.crosstab(result["sfdoc_class"], result["derived_class"]))
-
+    containers = result["containers"].str.split().explode().value_counts()
+    print("\ncontainers (number of documents):")
+    print(containers.rename(lambda c: c if c in KNOWN else f"{c}  <- unknown").to_string())
     mismatches = result[~result["match"]]
     columns = ["stack_id", "doc_idx", "tb_pages", "sfdoc_class", "n_datamatrix", "page_datamatrix", "n_axa03",
-               "complete", "missing_chunks", "derived_class"]
+               "complete", "missing_chunks", "fallback", "derived_class"]
     print(f"\nmismatches: {len(mismatches)}")
     if len(mismatches):
         print(mismatches[columns].to_string(index=False))
-    mismatch_path = Path(args.output).with_name(f"{Path(args.output).stem}_mismatches.csv")
+    mismatch_path = output.with_name(f"{output.stem}_mismatches.csv")
     mismatches.to_csv(mismatch_path, index=False)
-    print(args.output)
+    print(output)
     print(mismatch_path)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--batch-id", required=True)
+    parser.add_argument("--predictions", help="predict_stage1/2 CSV (production view); without it doc_id from the mapping groups the pages")
+    parser.add_argument("--limit-docs", type=int, help="random sample of Technikblatt documents")
+    parser.add_argument("--seed", type=int, default=13)
+    parser.add_argument("--dmtx-timeout", type=int, default=5000, help="libdmtx time limit per page in ms (fallback only)")
+    parser.add_argument("--save-payloads", action="store_true", help="write decoded container payloads for inspection")
+    args = parser.parse_args()
+
+    config = PipelineConfig(batch_id=args.batch_id)
+    out_dir = config.results_dir / "tb_check"
+    payload_dir = out_dir / "payloads"
+    payload_dir.mkdir(parents=True, exist_ok=True)
+
+    pages = pd.read_csv(config.model_pages_csv, dtype={column: str for column in DOCUMENT_KEY})
+    rows = documents_from_predictions(pd.read_csv(args.predictions), pages) if args.predictions else documents_from_labels(pages)
+    tb_docs, keys = select_documents(rows, args.limit_docs, args.seed)
+    result = check_documents(tb_docs, keys, config, args, payload_dir)
+    report(result, out_dir / ("tb_check_predictions.csv" if args.predictions else "tb_check_labels.csv"))
 
 
 if __name__ == "__main__":
