@@ -3,6 +3,7 @@
 import argparse
 import base64
 import gzip
+import zlib
 
 import numpy as np
 import pandas as pd
@@ -36,16 +37,18 @@ def fallback_texts(image):
 
 
 def read_chunks(page_texts):
-    """AXA03 chunks {container: {number: base64}}, chunk totals and the texts of the other Data Matrices."""
-    chunks, totals, other = {}, {}, []
+    """AXA03 chunks {container: {number: base64}}, chunk totals, the other Data Matrix texts and containers with conflicting chunks."""
+    chunks, totals, other, conflicts = {}, {}, [], set()
     for text in (text for texts in page_texts for text in texts):
         container, number, total, value = text[5:15], text[15:18], text[18:21], text[21:]
         if not text.startswith(HEADER) or not total.isdigit():
             other.append(text[:80])  # e.g. the small page-id Data Matrix
             continue
+        if chunks.get(container, {}).get(number, value) != value:
+            conflicts.add(container)  # same chunk number with another text, e.g. two Technikblätter in one document
         chunks.setdefault(container, {})[number] = value
         totals[container] = int(total)
-    return chunks, totals, other
+    return chunks, totals, other, conflicts
 
 
 def complete_containers(chunks, totals):
@@ -55,7 +58,7 @@ def complete_containers(chunks, totals):
 def decode_document(images):
     """zxing; if a chunk is missing, the fallback texts are added (merged, so the fallback never loses a code)."""
     page_texts = [zxing_texts(image) for image in images]
-    chunks, totals, _ = read_chunks(page_texts)
+    chunks, totals, _, _ = read_chunks(page_texts)
     complete = complete_containers(chunks, totals)
     fallback = not REQUIRED <= complete or complete != set(chunks)
     if fallback:
@@ -78,13 +81,13 @@ def payload(chunks, container):
     joined = "".join(chunks[container][n] for n in sorted(chunks[container]))
     try:
         return gzip.decompress(base64.b64decode(joined))
-    except (ValueError, OSError):
+    except (ValueError, OSError, zlib.error):
         return None
 
 
 def technikblatt_status(images):
     page_texts, fallback, broken_before = decode_document(images)
-    chunks, totals, other = read_chunks(page_texts)
+    chunks, totals, other, conflicts = read_chunks(page_texts)
     complete = complete_containers(chunks, totals)
     payloads = {container: payload(chunks, container) for container in complete}
     page_counts = [len(texts) for texts in page_texts]
@@ -96,6 +99,7 @@ def technikblatt_status(images):
         "complete": " ".join(sorted(complete)),
         "missing_chunks": " ".join(f"{c}:{totals[c] - len(chunks[c])}" for c in sorted(chunks) if c not in complete),
         "undecodable": " ".join(sorted(c for c, p in payloads.items() if p is None)),
+        "conflicting_chunks": " ".join(sorted(conflicts)),
         "fallback": fallback,
         "broken_before_fallback": broken_before,
         "broken": not REQUIRED <= complete,
@@ -156,6 +160,7 @@ def report(result, output):
     rescued = result["broken_before_fallback"] & ~result["broken"]
     print(f"documents: {len(result)}  broken: {result['broken'].mean():.3f}  match_sfdoc_class: {result['match'].mean():.3f}")
     print(f"fallback used: {result['fallback'].sum()}  rescued (broken -> not broken): {rescued.sum()}")
+    print(f"undecodable: {(result['undecodable'] != '').sum()}  conflicting_chunks: {(result['conflicting_chunks'] != '').sum()}")
     print(pd.crosstab(result["sfdoc_class"], result["derived_class"]))
     containers = result["containers"].str.split().explode().value_counts()
     print("\ncontainers (number of documents):")
