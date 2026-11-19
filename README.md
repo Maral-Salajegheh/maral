@@ -450,3 +450,6 @@ grep -ho "<pcInFilterDef:c_schicht>[^<]*" packages/life-docai-analytics/life_doc
 
 
 grep -ho "<pcInFilterDef:pdId>[^<]*" packages/life-docai-analytics/life_docai_analytics_antrag/classification/results/antrag_life_A00_G07_MAD/tb_check/payloads/*.bin | sort | uniq -c
+
+
+pixi run -e dev python -c "import zxingcpp; from PIL import Image; print([c.text for c in zxingcpp.read_barcodes(Image.open('<path_to_png>'), formats=zxingcpp.BarcodeFormat.DataMatrix)])"
