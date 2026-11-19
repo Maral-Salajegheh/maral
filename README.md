@@ -440,3 +440,13 @@ pixi run -e dev python -c "import zxingcpp; from importlib.metadata import versi
 
 
 pixi run -e dev python -m life_docai_analytics_antrag.classification.analysis.tb_datamatrix_check --batch-id antrag_life_A00_G07_MAD --limit-docs 300
+
+
+
+grep -ho "<pcInFilterDef:mandantId>[^<]*" packages/life-docai-analytics/life_docai_analytics_antrag/classification/results/antrag_life_A00_G07_MAD/tb_check/payloads/*.bin | sort | uniq -c
+
+
+grep -ho "<pcInFilterDef:c_schicht>[^<]*" packages/life-docai-analytics/life_docai_analytics_antrag/classification/results/antrag_life_A00_G07_MAD/tb_check/payloads/*.bin | sort | uniq -c
+
+
+grep -ho "<pcInFilterDef:pdId>[^<]*" packages/life-docai-analytics/life_docai_analytics_antrag/classification/results/antrag_life_A00_G07_MAD/tb_check/payloads/*.bin | sort | uniq -c
