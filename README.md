@@ -453,3 +453,14 @@ grep -ho "<pcInFilterDef:pdId>[^<]*" packages/life-docai-analytics/life_docai_an
 
 
 pixi run -e dev python -c "import zxingcpp; from PIL import Image; print([c.text for c in zxingcpp.read_barcodes(Image.open('<path_to_png>'), formats=zxingcpp.BarcodeFormat.DataMatrix)])"
+
+
+
+
+grep -ioE "<pcInFilterDef:[a-z_]*(schicht|bav|durchf|rout|finanz|traeger|mandant|gesellschaft|vertrieb|zugang)[a-z_]*>[^<]*" packages/life-docai-analytics/life_docai_analytics_antrag/classification/analysis/test/tb_datamatrix_results/payloads/MIH735396335/0000000103.bin
+
+
+grep -ioE "<[a-z]*:?[a-z_]*(schicht|bav|durchf|rout|finanz|traeger|mandant|gesellschaft|vertrieb|zugang)[a-z_]*>[^<]*" packages/life-docai-analytics/life_docai_analytics_antrag/classification/analysis/test/tb_datamatrix_results/payloads/MIH735396335/0000000102.bin
+
+
+diff <(grep -oE "<pcInFilterDef:[A-Za-z_]+>" packages/life-docai-analytics/life_docai_analytics_antrag/classification/results/antrag_life_A00_G07_MAD/tb_check/payloads/mkleb0100000093486_4_0000000103.bin | sort -u) <(grep -oE "<pcInFilterDef:[A-Za-z_]+>" packages/life-docai-analytics/life_docai_analytics_antrag/classification/analysis/test/tb_datamatrix_results/payloads/MIH735396335/0000000103.bin | sort -u)
