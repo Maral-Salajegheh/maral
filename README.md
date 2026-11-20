@@ -464,3 +464,11 @@ grep -ioE "<[a-z]*:?[a-z_]*(schicht|bav|durchf|rout|finanz|traeger|mandant|gesel
 
 
 diff <(grep -oE "<pcInFilterDef:[A-Za-z_]+>" packages/life-docai-analytics/life_docai_analytics_antrag/classification/results/antrag_life_A00_G07_MAD/tb_check/payloads/mkleb0100000093486_4_0000000103.bin | sort -u) <(grep -oE "<pcInFilterDef:[A-Za-z_]+>" packages/life-docai-analytics/life_docai_analytics_antrag/classification/analysis/test/tb_datamatrix_results/payloads/MIH735396335/0000000103.bin | sort -u)
+
+
+head -c 3000 packages/life-docai-analytics/life_docai_analytics_antrag/classification/analysis/test/tb_datamatrix_results/payloads/MIH735396335/0000000102.bin
+
+grep -rHoE "<pcInFilterDef:(kzbAV|kzFinanz|c_schicht|mandantId)>[^<]*" packages/life-docai-analytics/life_docai_analytics_antrag/classification/analysis/test/tb_datamatrix_results/payloads/MIH*/0000000103.bin
+
+
+grep -hoE "<pcInFilterDef:(kzbAV|kzFinanz|c_schicht)>[^<]*" packages/life-docai-analytics/life_docai_analytics_antrag/classification/results/antrag_life_A00_G07_MAD/tb_check/payloads/*_0000000103.bin | sort | uniq -c
