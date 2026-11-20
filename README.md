@@ -494,3 +494,12 @@ git log -p -10 -- pixi.lock | grep -iE "^[-+].*snowflake.connector.python"
 git log -p -10 -- pixi.toml | grep -iE "^[-+].*snowflake"
 
 pixi run -e dev python -c "import importlib.metadata as m; print([(d.metadata['Version'], str(d._path)) for d in m.distributions() if 'snowflake' in (d.metadata['Name'] or '').lower()])"
+
+
+pixi run -e dev python -m pip freeze > ~/dev_env_before.txt
+
+
+pixi run -e dev python -c "import importlib.metadata as m; print(m.version('snowflake-connector-python'))"
+
+
+pixi run -e dev python -m pip freeze | diff ~/dev_env_before.txt -
