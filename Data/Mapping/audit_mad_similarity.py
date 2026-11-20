@@ -4,8 +4,9 @@
 Dependencies: numpy, Pillow, pyarrow (no GPU, OCR, ImageHash or OpenCV).
 Run from the life-docai repository root:
   pixi run -e dev python audit_mad_similarity.py --stack-id mklia000000024690
-Omit --stack-id to inspect non-MAD MIDs marked UNRESOLVED in the mapping.
-Use --all-targets to include resolved non-MAD MIDs too.
+Only MIDs marked UNRESOLVED are comparison targets, even with --stack-id.
+Sibling MAD reference MIDs may have other statuses. Skipped stacks are reported.
+Place this script beside 00_map_mid_to_adb.py in datasets/mapping.
 
 Outputs are review suggestions, NOT approved matches or corrected labels.
 No input, image, mapping, or training file is modified. No network requests.
@@ -25,12 +26,14 @@ from PIL import Image, ImageOps
 
 def arguments():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument('--repo-root', type=Path, default=Path.cwd())
+    here = Path(__file__).resolve().parent
+    default_root = next((p for p in (here, *here.parents, Path.cwd(), *Path.cwd().parents)
+                         if (p / 'packages/life-docai-analytics').is_dir()), Path.cwd())
+    p.add_argument('--repo-root', type=Path, default=default_root)
     p.add_argument('--batch-id', default='antrag_life_A00_G07_MAD')
     p.add_argument('--mapping', type=Path, help='life_mid_pages.csv (not predictions or stack_pages).')
     p.add_argument('--inventory', type=Path, help='page_inventory.parquet from the render batch.')
-    p.add_argument('--stack-id', action='append', help='Repeat for several stacks; includes resolved targets in these stacks.')
-    p.add_argument('--all-targets', action='store_true')
+    p.add_argument('--stack-id', action='append', help='Repeat for several stacks; targets must still be UNRESOLVED.')
     p.add_argument('--top-k', type=int, default=3, help='Best candidates per reference page AND target MID, including poor matches.')
     p.add_argument('--phash-distance', type=int, default=12, help='Exploratory review cutoff out of 63 bits; NOT a validated threshold.')
     p.add_argument('--rotations', default='0,180', help='Reference rotations to try, e.g. 0,90,180,270.')
@@ -49,9 +52,10 @@ def arguments():
     except ValueError:
         p.error('Invalid rotations or OLD=NEW prefix.')
     base = a.repo_root / 'packages/life-docai-analytics/life_docai_analytics_antrag/datasets'
-    a.mapping = a.mapping or base / 'mapping/output/life_mid_pages.csv'
+    a.mapping = a.mapping or (here / 'output/life_mid_pages.csv' if (here / 'output/life_mid_pages.csv').is_file()
+                              else base / 'mapping/output/life_mid_pages.csv')
     a.inventory = a.inventory or base / 'aws_download_ingestion/output' / a.batch_id / 'page_inventory.parquet'
-    a.output_dir = a.output_dir or a.repo_root / ('mad_similarity_audit_' + datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S_%fZ'))
+    a.output_dir = a.output_dir or a.mapping.parent / ('mad_similarity_audit_' + datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S_%fZ'))
     return a
 
 
@@ -62,20 +66,41 @@ def normalized(row):
 def read_mapping(path, selected):
     groups = defaultdict(lambda: {'rows': [], 'classes': set(), 'statuses': set()})
     with path.open(newline='', encoding='utf-8-sig') as f:
-        reader = csv.DictReader(f)
+        sample = f.read(65536)
+        f.seek(0)
+        try:
+            dialect = csv.Sniffer().sniff(sample, delimiters=',;\t|')
+        except csv.Error:
+            dialect = csv.excel
+        reader = csv.DictReader(f, dialect=dialect)
         names = {x.strip().lower() for x in (reader.fieldnames or [])}
         if not {'stack_id', 'masterindex_id', 'pdf_page_number'} <= names or not ({'sst', 'page_class'} & names):
             raise ValueError('Mapping must contain stack_id, masterindex_id, pdf_page_number and sst or page_class.')
         for raw in reader:
             r = normalized(raw)
             stack, mid = r['stack_id'].lower(), r['masterindex_id']
-            if not stack or not mid or (selected and stack not in selected):
+            if not stack or not mid:
                 continue
             g = groups[(stack, mid)]
             g['rows'].append(r)
-            g['classes'].add((r.get('sst') or r.get('page_class', '')).upper())
+            label = (r.get('sst') or r.get('page_class', '')).upper()
+            if label:
+                g['classes'].add(label)
             g['statuses'].add(r.get('mid_alignment_status', ''))
+    if selected:
+        # Do not silently merge stack identities or strip meaningful zeroes.
+        groups = {key: value for key, value in groups.items() if key[0] in selected}
     return groups
+
+
+def reference_pages(group, pages):
+    """Use MAD-specific pages, not an entire mixed MID as a reference."""
+    if group['classes'] == {'MAD'}:
+        return pages
+    positions = {r['pdf_page_number'] for r in group['rows']
+                 if (r.get('page_class') or r.get('sst', '')).upper() == 'MAD'
+                 and r.get('mid_alignment_status') in ('ALIGNED', 'RESOLVED_FOREIGN')}
+    return [r for r in pages if str(r['source_page_number']) in positions]
 
 
 def read_inventory(path, mids):
@@ -196,18 +221,27 @@ def main():
     for (stack, mid), group in groups.items():
         mid_stacks[mid].add(stack)
         stacks[stack][mid] = group
-    if any(len(v) > 1 for v in mid_stacks.values()):
-        raise ValueError('A MID is assigned to multiple stacks in the mapping; resolve before auditing.')
+    ambiguous_mids = {mid for mid, values in mid_stacks.items() if len(values) > 1}
     jobs = []
+    skipped = []
+    for stack in sorted(selected - set(stacks)):
+        skipped.append({'stack_id': stack, 'status': 'STACK_NOT_FOUND_IN_MAPPING'})
     for stack, mids in sorted(stacks.items()):
-        # Only pure MAD MIDs serve as references; mixed MIDs are not assumed MAD.
-        refs = [mid for mid, g in mids.items() if g['classes'] == {'MAD'}]
-        targets = [mid for mid, g in mids.items() if mid not in refs and
-                   (selected or args.all_targets or any(s.startswith('UNRESOLVED') for s in g['statuses']))]
+        if any(mid in ambiguous_mids for mid in mids):
+            skipped.append({'stack_id': stack, 'status': 'AMBIGUOUS_MID_STACK_ASSIGNMENT'})
+            continue
+        refs = [mid for mid, g in mids.items() if 'MAD' in g['classes'] or
+                any(r.get('page_class', '').upper() == 'MAD' for r in g['rows'])]
+        targets = [mid for mid, g in mids.items() if g['classes'] != {'MAD'}
+                   and any(s.upper().startswith('UNRESOLVED') for s in g['statuses'])]
+        if not targets:
+            skipped.append({'stack_id': stack, 'status': 'NO_UNRESOLVED_TARGET_MID'})
+            continue
+        refs = [mid for mid in refs if any(target != mid for target in targets)]
         if refs and targets:
             jobs.append((stack, refs, targets))
-    if not jobs:
-        raise ValueError('No eligible stack with a separate pure MAD MID and target MID. Check inputs or --all-targets.')
+        else:
+            skipped.append({'stack_id': stack, 'status': 'NO_MAD_REFERENCE' if not refs else 'NO_OTHER_TARGET_MID'})
     needed = {mid for _, refs, targets in jobs for mid in refs + targets}
     inventory = read_inventory(args.inventory, needed)
     args.output_dir.mkdir(parents=True, exist_ok=False)
@@ -226,18 +260,22 @@ def main():
             'best_phash_distance_63bits', 'candidates_within_cutoff', 'status']); files.append(f)
         f, errors = writer(args.output_dir, 'errors.csv', ['stack_id', 'masterindex_id', 'pdf_page_number',
                                                           'image_path', 'error']); files.append(f)
+        f, skips = writer(args.output_dir, 'skipped_stacks.csv', ['stack_id', 'status']); files.append(f)
+        skips.writerows(skipped)
         total = 0
         for index, (stack, refs, targets) in enumerate(jobs, 1):
             print(f'[{index}/{len(jobs)}] {stack}', flush=True)
             # Bound memory to one target MID at a time; reference pages reused.
             ref_pages = {mid: [load_page(r, args, args.rotations, errors, stack)
-                               for r in inventory.get(mid, [])] for mid in refs}
+                               for r in reference_pages(groups[(stack, mid)], inventory.get(mid, []))] for mid in refs}
             for mid in targets:
                 target_pages = [p for r in inventory.get(mid, [])
                                 if (p := load_page(r, args, [0], errors, stack)) is not None]
                 group = groups[(stack, mid)]
                 status = '|'.join(sorted(group['statuses']))
                 for refmid in refs:
+                    if refmid == mid:
+                        continue
                     refs_available = ref_pages[refmid]
                     # Empty references still produce an explicit summary row.
                     for ref in refs_available or [None]:
@@ -283,12 +321,15 @@ def main():
             for f in files:
                 f.flush()
         run = {'mapping': str(args.mapping.resolve()), 'inventory': str(args.inventory.resolve()),
-               'stacks_processed': len(jobs), 'candidate_rows': total, 'top_k': args.top_k,
+               'stacks_processed': len(jobs), 'stacks_skipped': len(skipped),
+               'mapping_mid_groups': len(groups), 'candidate_rows': total, 'top_k': args.top_k,
+               'target_scope': 'UNRESOLVED only (including explicit --stack-id selection)',
                'phash_review_cutoff': args.phash_distance, 'rotations': args.rotations,
                'requested_stacks_not_processed': sorted(selected - {j[0] for j in jobs}),
                'notice': 'Suggestions only. Scores are not probabilities. No automatic deletion or mapping edits. '
                          'Current mapping labels may be wrong. Cross-reference matches are not globally one-to-one. '
-                         'Only successful renders and pure MAD reference MIDs present in these inputs are considered.'}
+                         'References are pure MAD MIDs or MAD pages of aligned mixed MIDs. '
+                         'No reference means no content-based MAD detection; see skipped_stacks.csv and summary.csv.'}
         with (args.output_dir / 'run_info.json').open('x', encoding='utf-8') as f:
             json.dump(run, f, indent=2, ensure_ascii=False)
         print(f'Saved {total} candidate rows: {args.output_dir.resolve()}')
