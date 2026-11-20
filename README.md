@@ -528,3 +528,28 @@ cd ~/Projects/life-docai
 pixi run -e dev python \
   packages/life-docai-analytics/life_docai_analytics_antrag/datasets/mapping/audit_mad_similarity.py \
   --stack-id mklia000000024690
+
+
+
+  pixi run -e dev python - <<'PY'
+import csv
+from collections import defaultdict
+from pathlib import Path
+
+path = Path("packages/life-docai-analytics/life_docai_analytics_antrag/datasets/mapping/output/life_mid_pages.csv")
+stack = "mklia000000024690"
+groups = defaultdict(lambda: {"rows": 0, "sst": set(), "status": set()})
+
+with path.open(newline="", encoding="utf-8-sig") as f:
+    for r in csv.DictReader(f):
+        if r["stack_id"].strip().lower() == stack:
+            g = groups[r["masterindex_id"]]
+            g["rows"] += 1
+            g["sst"].add(r.get("sst", ""))
+            g["status"].add(r.get("mid_alignment_status", ""))
+
+print("Mapping:", path.resolve())
+print("MIDs found:", len(groups))
+for mid, info in groups.items():
+    print(mid, info)
+PY
