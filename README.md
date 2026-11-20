@@ -487,3 +487,8 @@ pixi add -f dev "snowflake-connector-python==X.Y.Z"
 git diff --stat pixi.lock
 
 pixi run -e dev python -c "from life_docai.utils.snowflake_utils import get_engine; print('ok')"
+
+
+git log -p -10 -- pixi.lock | grep -iE "^[-+].*snowflake.connector.python"
+
+git log -p -10 -- pixi.toml | grep -iE "^[-+].*snowflake"
