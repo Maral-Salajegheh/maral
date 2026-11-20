@@ -521,3 +521,10 @@ pixi run -e dev python -c "import torch, torchvision, transformers, timm, open_c
 
 
 pixi run -e dev python packages/life-docai-analytics/life_docai_analytics_antrag/datasets/mapping/00_map_mid_to_adb.py --schema D131_D2D
+
+
+cd ~/Projects/life-docai
+
+pixi run -e dev python \
+  packages/life-docai-analytics/life_docai_analytics_antrag/datasets/mapping/audit_mad_similarity.py \
+  --stack-id mklia000000024690
