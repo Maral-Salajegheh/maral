@@ -510,3 +510,14 @@ pixi run -e dev python -c "import importlib.metadata as m; print(m.version('snow
 pixi run -e dev python -c "from life_docai.utils.snowflake_utils import get_engine; print('ok')"
 
 ls /home/I060689/pixi-envs/life-docai-17008287725071932524/envs/dev/lib/python3.12/site-packages | grep -E "dist-info|egg-info" | diff ~/dev_env_before.txt -
+
+
+
+
+pixi run -e dev python -c "from life_docai.utils.snowflake_utils import get_engine; print('ok')"
+
+pixi run -e dev python -c "import torch, torchvision, transformers, timm, open_clip, mlflow, paddleocr, cv2; print('ok', torch.__version__, torch.cuda.is_available())"
+
+
+
+pixi run -e dev python packages/life-docai-analytics/life_docai_analytics_antrag/datasets/mapping/00_map_mid_to_adb.py --schema D131_D2D
