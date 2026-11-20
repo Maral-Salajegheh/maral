@@ -553,3 +553,34 @@ print("MIDs found:", len(groups))
 for mid, info in groups.items():
     print(mid, info)
 PY
+
+
+
+pixi run -e dev python - <<'PY'
+import csv
+from collections import Counter
+from pathlib import Path
+
+path = Path("packages/life-docai-analytics/life_docai_analytics_antrag/datasets/mapping/output/life_mid_pages.csv")
+counts = Counter()
+matches = Counter()
+
+with path.open(newline="", encoding="utf-8-sig") as f:
+    reader = csv.DictReader(f)
+    print("Columns:", reader.fieldnames)
+    for row in reader:
+        counts[row.get("sst", "")] += 1
+        stack = row.get("stack_id", "").strip()
+        if stack.endswith("24690"):
+            matches[(
+                stack,
+                row.get("masterindex_id", ""),
+                row.get("sst", ""),
+                row.get("mid_alignment_status", "")
+            )] += 1
+
+print("SST counts:", counts)
+print("Stacks ending in 24690:")
+for values, count in matches.items():
+    print(repr(values), "rows:", count)
+PY
