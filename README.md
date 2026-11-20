@@ -472,3 +472,8 @@ grep -rHoE "<pcInFilterDef:(kzbAV|kzFinanz|c_schicht|mandantId)>[^<]*" packages/
 
 
 grep -hoE "<pcInFilterDef:(kzbAV|kzFinanz|c_schicht)>[^<]*" packages/life-docai-analytics/life_docai_analytics_antrag/classification/results/antrag_life_A00_G07_MAD/tb_check/payloads/*_0000000103.bin | sort | uniq -c
+
+
+grep -hoE "<pcInFilterDef:(kzbAV|kzFinanz|c_schicht)>[^<]*" packages/life-docai-analytics/life_docai_analytics_antrag/classification/results/antrag_life_A00_G07_MAD/tb_check/payloads/*_0000000103.bin | sort | uniq -c
+
+pixi run -e dev python -c "import importlib.metadata as m; print([r for r in m.distribution('snowflake-connector-python').requires if 'pyarrow' in r])"
