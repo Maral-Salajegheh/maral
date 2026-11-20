@@ -477,3 +477,13 @@ grep -hoE "<pcInFilterDef:(kzbAV|kzFinanz|c_schicht)>[^<]*" packages/life-docai-
 grep -hoE "<pcInFilterDef:(kzbAV|kzFinanz|c_schicht)>[^<]*" packages/life-docai-analytics/life_docai_analytics_antrag/classification/results/antrag_life_A00_G07_MAD/tb_check/payloads/*_0000000103.bin | sort | uniq -c
 
 pixi run -e dev python -c "import importlib.metadata as m; print([r for r in m.distribution('snowflake-connector-python').requires if 'pyarrow' in r])"
+
+
+git log -p -5 -- pixi.lock | grep -E "^[-+].*snowflake-connector-python-[0-9]"
+
+pixi add -f dev "snowflake-connector-python==X.Y.Z"
+
+
+git diff --stat pixi.lock
+
+pixi run -e dev python -c "from life_docai.utils.snowflake_utils import get_engine; print('ok')"
