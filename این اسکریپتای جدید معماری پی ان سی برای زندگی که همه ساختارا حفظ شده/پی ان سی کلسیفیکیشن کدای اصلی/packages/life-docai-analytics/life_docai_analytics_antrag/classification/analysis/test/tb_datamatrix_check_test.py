@@ -6,6 +6,7 @@ Run from the life-docai repository root with:
 Expected layout next to this script:
     AMB_AMU/Rendered_AMB_AMU/AMB/...
     AMB_AMU/Rendered_AMB_AMU/AMU/...
+    AMB_AMU/page_inventory.csv
 """
 
 import base64
@@ -13,6 +14,7 @@ import csv
 import gzip
 import re
 import zlib
+from collections import defaultdict
 from pathlib import Path
 
 import zxingcpp
@@ -29,12 +31,47 @@ REQUIRED = {ANTRAG, ANGEBOT}
 KNOWN = {PARTNER, ZUSATZ, ANTRAG, ANGEBOT}
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"}
 MID_PATTERN = re.compile(r"MIH\d+", re.IGNORECASE)
+PDF_PAGE_PATTERN = re.compile(r"(pdf_\d+_\d+)/(page_\d+\.[^.]+)$", re.IGNORECASE)
+GROUP_PATTERN = re.compile(r"(?:^|/)(AMB|AMU)(?:/|$)", re.IGNORECASE)
 
 
-def extract_mid(path):
-    """Get the MIH identifier from the rendered image's folder or filename."""
-    match = MID_PATTERN.search(str(path))
-    return match.group(0) if match else ""
+def inventory_mid_map():
+    """Map rendered-image identity to MID using page_inventory.csv.
+
+    MIH identifiers live in pdf_path_in_zip, while rendered PNG paths use
+    generated pdf_NNN_... folder names. The inventory connects the two.
+    """
+    inventory = HERE / "AMB_AMU" / "page_inventory.csv"
+    if not inventory.is_file():
+        raise FileNotFoundError(f"Page inventory not found: {inventory}")
+
+    mapping = {}
+    with inventory.open(newline="", encoding="utf-8-sig") as f:
+        reader = csv.DictReader(f)
+        required = {"pdf_path_in_zip", "image_path"}
+        if not required.issubset(reader.fieldnames or []):
+            raise ValueError(f"{inventory} must contain columns {sorted(required)}")
+        for row in reader:
+            mid_match = MID_PATTERN.search(row["pdf_path_in_zip"] or "")
+            image_path = row["image_path"] or ""
+            identity = PDF_PAGE_PATTERN.search(image_path.replace("\\", "/"))
+            group_match = GROUP_PATTERN.search(image_path.replace("\\", "/"))
+            if mid_match and identity and group_match:
+                key = group_match.group(1).upper(), identity.group(1).lower(), identity.group(2).lower()
+                mid = mid_match.group(0)
+                if key in mapping and mapping[key] != mid:
+                    mapping[key] = "__AMBIGUOUS__"
+                else:
+                    mapping[key] = mid
+    return mapping
+
+
+def extract_mid(path, group, mid_map):
+    """Resolve MID by matching the rendered PDF/page tokens to inventory."""
+    match = PDF_PAGE_PATTERN.search(path.as_posix())
+    if not match:
+        return ""
+    return mid_map.get((group.upper(), match.group(1).lower(), match.group(2).lower()), "")
 
 
 def read_codes(image):
@@ -101,11 +138,12 @@ def scan_image(path):
         "other_data_matrix": " | ".join(other),
         "raw_codes": " | ".join(codes),
     }
-    return result, payloads
+    return result, payloads, codes
 
 
 def main():
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    mid_map = inventory_mid_map()
     images = []
     for group, directory in INPUT_DIRS.items():
         if not directory.is_dir():
@@ -117,12 +155,16 @@ def main():
         raise FileNotFoundError(f"No supported images found under {RENDER_ROOT}")
 
     rows = []
+    codes_by_mid = defaultdict(list)
     payload_dir = OUTPUT_DIR / "payloads"
     for i, (group, path) in enumerate(images, start=1):
         try:
-            status, payloads = scan_image(path)
-            rows.append({"group": group, "mid": extract_mid(path),
+            status, payloads, codes = scan_image(path)
+            mid = extract_mid(path, group, mid_map)
+            rows.append({"group": group, "mid": mid,
                          "image_path": str(path.relative_to(HERE)), **status})
+            if mid and mid != "__AMBIGUOUS__":
+                codes_by_mid[mid].extend(codes)
             for container, data in payloads.items():
                 if data is not None:
                     payload_dir.mkdir(parents=True, exist_ok=True)
@@ -131,10 +173,32 @@ def main():
                     out.parent.mkdir(parents=True, exist_ok=True)
                     out.write_bytes(data)
         except Exception as exc:
-            rows.append({"group": group, "mid": extract_mid(path),
+            rows.append({"group": group, "mid": extract_mid(path, group, mid_map),
                          "image_path": str(path.relative_to(HERE)), "error": repr(exc)})
         if i % 100 == 0 or i == len(images):
             print(f"Scanned {i}/{len(images)} images")
+
+    # Reassemble AXA03 chunks across every rendered page belonging to the same MID.
+    document_status = {}
+    for mid, codes in codes_by_mid.items():
+        chunks, totals, complete, _, conflicts = parse_codes(codes)
+        payloads = {c: decode_payload(chunks[c]) for c in complete}
+        document_status[mid] = {
+            "mid_complete_containers": " ".join(sorted(complete)),
+            "mid_missing_chunks": " ".join(
+                f"{c}:{totals[c] - len(chunks[c])}" for c in sorted(chunks) if c not in complete
+            ),
+            "mid_conflicting_chunks": " ".join(sorted(conflicts)),
+            "mid_undecodable_containers": " ".join(sorted(c for c, data in payloads.items() if data is None)),
+            "mid_broken": not REQUIRED.issubset(complete),
+        }
+        for container, data in payloads.items():
+            if data is not None:
+                out = OUTPUT_DIR / "payloads" / mid / f"{container}.bin"
+                out.parent.mkdir(parents=True, exist_ok=True)
+                out.write_bytes(data)
+    for row in rows:
+        row.update(document_status.get(row.get("mid", ""), {}))
 
     output_csv = OUTPUT_DIR / "data_matrix_scan.csv"
     columns = ["group", "mid", "image_path"] + sorted(
