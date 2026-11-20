@@ -4,8 +4,9 @@
 Dependencies: numpy, Pillow, pyarrow (no GPU, OCR, ImageHash or OpenCV).
 Run from the life-docai repository root:
   pixi run -e dev python audit_mad_similarity.py --stack-id mklia000000024690
-Only MIDs marked UNRESOLVED are comparison targets, even with --stack-id.
-Sibling MAD reference MIDs may have other statuses. Skipped stacks are reported.
+Targets have successful rendered pages in the supplied inventory and MORE
+physical pages than mapping rows. CSV alignment status is reported, not used
+as a selection gate. Only same-stack rendered MAD references are compared.
 Place this script beside 00_map_mid_to_adb.py in datasets/mapping.
 
 Outputs are review suggestions, NOT approved matches or corrected labels.
@@ -33,7 +34,7 @@ def arguments():
     p.add_argument('--batch-id', default='antrag_life_A00_G07_MAD')
     p.add_argument('--mapping', type=Path, help='life_mid_pages.csv (not predictions or stack_pages).')
     p.add_argument('--inventory', type=Path, help='page_inventory.parquet from the render batch.')
-    p.add_argument('--stack-id', action='append', help='Repeat for several stacks; targets must still be UNRESOLVED.')
+    p.add_argument('--stack-id', action='append', help='Repeat to restrict stacks; targets must have extra rendered pages.')
     p.add_argument('--top-k', type=int, default=3, help='Best candidates per reference page AND target MID, including poor matches.')
     p.add_argument('--phash-distance', type=int, default=12, help='Exploratory review cutoff out of 63 bits; NOT a validated threshold.')
     p.add_argument('--rotations', default='0,180', help='Reference rotations to try, e.g. 0,90,180,270.')
@@ -110,7 +111,7 @@ def read_inventory(path, mids):
     available = set(parquet.schema_arrow.names)
     if not required <= available:
         raise ValueError('Missing inventory columns: ' + ', '.join(sorted(required - available)))
-    columns = sorted(required | ({'image_sha256', 'quality_status'} & available))
+    columns = sorted(required | ({'image_sha256', 'quality_status', 'corpus_document_page_count'} & available))
     result = defaultdict(list)
     seen = set()
     for batch in parquet.iter_batches(columns=columns, batch_size=32768):
@@ -222,35 +223,60 @@ def main():
         mid_stacks[mid].add(stack)
         stacks[stack][mid] = group
     ambiguous_mids = {mid for mid, values in mid_stacks.items() if len(values) > 1}
+    # Inventory is read BEFORE choosing targets: mapping may predate rendering.
+    inventory = read_inventory(args.inventory, set(mid_stacks))
     jobs = []
     skipped = []
+    scope_rows = []
     for stack in sorted(selected - set(stacks)):
         skipped.append({'stack_id': stack, 'status': 'STACK_NOT_FOUND_IN_MAPPING'})
     for stack, mids in sorted(stacks.items()):
         if any(mid in ambiguous_mids for mid in mids):
             skipped.append({'stack_id': stack, 'status': 'AMBIGUOUS_MID_STACK_ASSIGNMENT'})
             continue
-        refs = [mid for mid, g in mids.items() if 'MAD' in g['classes'] or
-                any(r.get('page_class', '').upper() == 'MAD' for r in g['rows'])]
-        targets = [mid for mid, g in mids.items() if g['classes'] != {'MAD'}
-                   and any(s.upper().startswith('UNRESOLVED') for s in g['statuses'])]
+        targets = []
+        for mid, group in mids.items():
+            pages = inventory.get(mid, [])
+            expected = {int(r['corpus_document_page_count']) for r in pages
+                        if r.get('corpus_document_page_count') is not None}
+            complete = not expected or (len(expected) == 1 and
+                        {r['source_page_number'] for r in pages} == set(range(1, next(iter(expected)) + 1)))
+            extra = len(pages) - len(group['rows'])
+            if not pages:
+                decision = 'NOT_IN_RENDERED_SAMPLE'
+            elif not complete:
+                decision = 'INCOMPLETE_RENDER_INVENTORY'
+            elif group['classes'] == {'MAD'}:
+                decision = 'MAD_REFERENCE_MID'
+            elif extra > 0:
+                decision = 'EXTRA_PAGES_TARGET'
+                targets.append(mid)
+            elif extra == 0:
+                decision = 'NO_EXTRA_RENDERED_PAGES'
+            else:
+                decision = 'FEWER_RENDERED_PAGES_THAN_MAPPING_ROWS'
+            scope_rows.append(dict(stack_id=stack, masterindex_id=mid,
+                mapping_rows=len(group['rows']), successful_rendered_pages=len(pages),
+                extra_rendered_pages=extra if pages else '',
+                mapping_alignment_status='|'.join(sorted(group['statuses'])), decision=decision))
         if not targets:
-            skipped.append({'stack_id': stack, 'status': 'NO_UNRESOLVED_TARGET_MID'})
+            skipped.append({'stack_id': stack, 'status': 'NO_RENDERED_EXTRA_PAGE_TARGET'})
             continue
-        refs = [mid for mid in refs if any(target != mid for target in targets)]
+        refs = [mid for mid, g in mids.items()
+                if any(target != mid for target in targets)
+                and reference_pages(g, inventory.get(mid, []))]
         if refs and targets:
             jobs.append((stack, refs, targets))
         else:
             skipped.append({'stack_id': stack, 'status': 'NO_MAD_REFERENCE' if not refs else 'NO_OTHER_TARGET_MID'})
-    needed = {mid for _, refs, targets in jobs for mid in refs + targets}
-    inventory = read_inventory(args.inventory, needed)
     args.output_dir.mkdir(parents=True, exist_ok=False)
     common = ['stack_id', 'main_masterindex_id', 'main_pdf_page_number', 'mad_masterindex_id',
               'mad_pdf_page_number', 'candidate_rank', 'phash_distance_63bits', 'within_review_cutoff',
               'reference_rotation_degrees', 'ink_overlap_f1', 'gray_mae', 'shift_x_normalized_px',
               'shift_y_normalized_px', 'low_information_image', 'exact_sha256_match',
               'main_quality_status', 'mad_quality_status', 'main_image_path', 'mad_image_path',
-              'main_alignment_status', 'main_current_mapping_rows', 'mad_current_mapping_rows', 'review_status']
+              'main_alignment_status', 'main_extra_rendered_pages',
+              'main_current_mapping_rows', 'mad_current_mapping_rows', 'review_status']
     files = []
     try:
         f, candidates = writer(args.output_dir, 'candidates.csv', common); files.append(f)
@@ -262,6 +288,10 @@ def main():
                                                           'image_path', 'error']); files.append(f)
         f, skips = writer(args.output_dir, 'skipped_stacks.csv', ['stack_id', 'status']); files.append(f)
         skips.writerows(skipped)
+        f, scope = writer(args.output_dir, 'mid_scope.csv', ['stack_id', 'masterindex_id',
+            'mapping_rows', 'successful_rendered_pages', 'extra_rendered_pages',
+            'mapping_alignment_status', 'decision']); files.append(f)
+        scope.writerows(scope_rows)
         total = 0
         for index, (stack, refs, targets) in enumerate(jobs, 1):
             print(f'[{index}/{len(jobs)}] {stack}', flush=True)
@@ -314,6 +344,7 @@ def main():
                                 exact_sha256_match=exact, main_quality_status=target.get('quality_status', ''),
                                 mad_quality_status=ref.get('quality_status', ''), main_image_path=target['resolved_image_path'],
                                 mad_image_path=ref['resolved_image_path'], main_alignment_status=status,
+                                main_extra_rendered_pages=len(inventory[mid]) - len(group['rows']),
                                 main_current_mapping_rows=mapped_rows(group, page),
                                 mad_current_mapping_rows=mapped_rows(groups[(stack, refmid)], ref['source_page_number']),
                                 review_status=review))
@@ -323,7 +354,8 @@ def main():
         run = {'mapping': str(args.mapping.resolve()), 'inventory': str(args.inventory.resolve()),
                'stacks_processed': len(jobs), 'stacks_skipped': len(skipped),
                'mapping_mid_groups': len(groups), 'candidate_rows': total, 'top_k': args.top_k,
-               'target_scope': 'UNRESOLVED only (including explicit --stack-id selection)',
+               'target_scope': 'Inventory-confirmed extra rendered pages relative to mapping rows; CSV status is informational',
+               'rendered_mapping_mids': len(inventory),
                'phash_review_cutoff': args.phash_distance, 'rotations': args.rotations,
                'requested_stacks_not_processed': sorted(selected - {j[0] for j in jobs}),
                'notice': 'Suggestions only. Scores are not probabilities. No automatic deletion or mapping edits. '
