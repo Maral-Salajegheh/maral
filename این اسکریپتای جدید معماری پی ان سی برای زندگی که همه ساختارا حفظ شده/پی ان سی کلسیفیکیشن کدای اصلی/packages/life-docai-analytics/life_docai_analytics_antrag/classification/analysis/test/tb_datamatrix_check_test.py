@@ -19,7 +19,7 @@ from PIL import Image, ImageFilter, ImageOps
 
 
 HERE = Path(__file__).resolve().parent
-RENDER_ROOT = HERE / "Rendered_AMB_AMU"
+RENDER_ROOT = HERE / "AMB_AMU" / "Rendered_AMB_AMU"
 INPUT_DIRS = {"AMB": RENDER_ROOT / "AMB", "AMU": RENDER_ROOT / "AMU"}
 OUTPUT_DIR = HERE / "tb_datamatrix_results"
 HEADER = "AXA03"
