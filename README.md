@@ -492,3 +492,5 @@ pixi run -e dev python -c "from life_docai.utils.snowflake_utils import get_engi
 git log -p -10 -- pixi.lock | grep -iE "^[-+].*snowflake.connector.python"
 
 git log -p -10 -- pixi.toml | grep -iE "^[-+].*snowflake"
+
+pixi run -e dev python -c "import importlib.metadata as m; print([(d.metadata['Version'], str(d._path)) for d in m.distributions() if 'snowflake' in (d.metadata['Name'] or '').lower()])"
