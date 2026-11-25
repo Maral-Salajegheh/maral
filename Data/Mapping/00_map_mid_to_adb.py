@@ -35,9 +35,9 @@ pdf_page_source says which was used, and mid_alignment_status says why.
 
 Run from the mapping directory:
 
-    pixi run -e dev python 00_map_mid_to_adb.py --schema D131_D2D
+    pixi run -e dev python 00_map_mid_to_adb.py --schema D131_D2D --batch-id <batch_id>
 
-Outputs are written to the existing output directory:
+Outputs are written to output/<batch_id>/, one folder per batch:
 
     life_mid_documents.csv
     life_mid_documents.parquet
@@ -72,11 +72,14 @@ INGESTION_DIR = MAPPING_DIR.parent / "aws_download_ingestion"
 SOURCE_PAGE_TABLE = "PROC_LIFE_FINAL_PAGE_LABELS"
 SNOWFLAKE_OUTPUT_TABLE = "PROC_LIFE_MID_ADB"
 
-DOCUMENTS_CSV = OUTPUT_DIR / "life_mid_documents.csv"
-DOCUMENTS_PARQUET = OUTPUT_DIR / "life_mid_documents.parquet"
-PAGES_CSV = OUTPUT_DIR / "life_mid_pages.csv"
-PAGES_PARQUET = OUTPUT_DIR / "life_mid_pages.parquet"
-SUMMARY_CSV = OUTPUT_DIR / "life_mid_summary.csv"
+DOCUMENTS = "life_mid_documents"
+PAGES = "life_mid_pages"
+SUMMARY = "life_mid_summary"
+
+
+def output_path(batch_id: str, name: str, suffix: str = ".csv") -> Path:
+    """Mapping outputs of one batch: output/<batch_id>/<name><suffix>."""
+    return OUTPUT_DIR / batch_id / f"{name}{suffix}"
 
 OK = "OK"
 TB0 = "TB0"
@@ -955,30 +958,27 @@ def status_summary(documents: pd.DataFrame) -> pd.DataFrame:
     )
 
 
-def write_frame(data: pd.DataFrame, csv_path: Path, parquet_path: Path) -> None:
-    data.to_csv(csv_path, index=False, encoding="utf-8-sig")
+def write_frame(data: pd.DataFrame, batch_id: str, name: str) -> None:
+    data.to_csv(output_path(batch_id, name), index=False, encoding="utf-8-sig")
+    parquet_path = output_path(batch_id, name, ".parquet")
     try:
         data.to_parquet(parquet_path, index=False)
     except ImportError:
         print(f"WARNING: Parquet skipped for {parquet_path.name}; pyarrow missing.")
 
 
-def write_outputs(documents: pd.DataFrame, pages: pd.DataFrame) -> None:
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+def write_outputs(documents: pd.DataFrame, pages: pd.DataFrame, batch_id: str) -> None:
+    (OUTPUT_DIR / batch_id).mkdir(parents=True, exist_ok=True)
     documents = documents.sort_values(
         ["stack_id_key", "first_delivery_row"],
         na_position="last",
     )
     document_columns = [column for column in DOCUMENT_COLUMNS if column in documents]
     page_columns = [column for column in PAGE_COLUMNS if column in pages]
-    write_frame(
-        documents[document_columns],
-        DOCUMENTS_CSV,
-        DOCUMENTS_PARQUET,
-    )
-    write_frame(pages[page_columns], PAGES_CSV, PAGES_PARQUET)
+    write_frame(documents[document_columns], batch_id, DOCUMENTS)
+    write_frame(pages[page_columns], batch_id, PAGES)
     status_summary(documents).to_csv(
-        SUMMARY_CSV,
+        output_path(batch_id, SUMMARY),
         index=False,
         encoding="utf-8-sig",
     )
@@ -1044,10 +1044,11 @@ def print_report(documents: pd.DataFrame, pages: pd.DataFrame) -> None:
 # Optional publication
 # ---------------------------------------------------------------------------
 
-def load_existing_documents() -> pd.DataFrame:
-    if not DOCUMENTS_CSV.is_file():
-        raise FileNotFoundError(f"Not found: {DOCUMENTS_CSV}\nBuild the mapping first.")
-    data = pd.read_csv(DOCUMENTS_CSV, dtype=str, low_memory=False)
+def load_existing_documents(batch_id: str) -> pd.DataFrame:
+    path = output_path(batch_id, DOCUMENTS)
+    if not path.is_file():
+        raise FileNotFoundError(f"Not found: {path}\nBuild the mapping first.")
+    data = pd.read_csv(path, dtype=str, low_memory=False)
     data["is_usable"] = data["is_usable"].astype(str).str.lower().eq("true")
     return data
 
@@ -1133,11 +1134,11 @@ def build(args: argparse.Namespace, engine: sqlalchemy.Engine, schema: str) -> N
     )
     pages = build_pages(mid_pages)
 
-    write_outputs(documents, pages)
+    write_outputs(documents, pages, args.batch_id)
     print_report(documents, pages)
-    print(f"\nDocuments: {DOCUMENTS_CSV}")
-    print(f"Pages:     {PAGES_CSV}")
-    print(f"Summary:   {SUMMARY_CSV}")
+    print(f"\nDocuments: {output_path(args.batch_id, DOCUMENTS)}")
+    print(f"Pages:     {output_path(args.batch_id, PAGES)}")
+    print(f"Summary:   {output_path(args.batch_id, SUMMARY)}")
 
 
 def main() -> int:
@@ -1146,7 +1147,7 @@ def main() -> int:
     engine = get_engine(schema=schema)
 
     if args.publish_snowflake:
-        documents = load_existing_documents()
+        documents = load_existing_documents(args.batch_id)
         if args.yes or confirm_publish(schema):
             publish_to_snowflake(documents, engine, schema)
     else:
