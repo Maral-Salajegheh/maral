@@ -34,7 +34,7 @@ class PipelineConfig:
     # ---- upstream inputs -------------------------------------------------
     @property
     def mapping_output(self) -> Path:
-        return self.root / DATASETS_DIR / MAPPING_DIR / "output"
+        return self.root / DATASETS_DIR / MAPPING_DIR / "output" / self.batch_id
 
     @property
     def ingestion_root(self) -> Path:
