@@ -28,8 +28,9 @@ MODEL_FIELDS = [
     "page_identity", "stack_id", "stack_position", "image_id", "masterindex_id", "pdf_page_number",
     "image_path", "image_sha256", "has_label", "page_class", "class_target",
     "is_first_page", "segmentation_target", "is_last_page", "last_page_target", "document_key_source",
-    "process_id", "doc_id", "subdoc_idx", "sfdoc_class", "label_tier", "training_label_quality",
+    "process_id", "doc_id", "subdoc_idx", "sfdoc_class", "label_tier", "training_label_quality", "sst",
 ]
+LABELED_SSTS = {"A00", "G07", "MAD"}  # other SSTs (E00, AME, AMB, ...) carry no page label
 
 
 # ---------------------------------------------------------------------------
@@ -90,6 +91,13 @@ def split_assignments(config: PipelineConfig, rows, seed=13):
 
 def _true(value):
     return str(value).strip().lower() == "true"
+
+
+def class_target(label):
+    """Page-class id, or IGNORE_INDEX for a page of an SST without page labels."""
+    if label["sst"] not in LABELED_SSTS:
+        return IGNORE_INDEX
+    return CLASS_TO_ID[label["page_class"]]
 
 
 def population_hash(rows):
@@ -181,6 +189,7 @@ def build_stack_population(config: PipelineConfig):
         keys, sources, stats = resolve_document_keys(pages)
         key_stats.update(stats)
         for pos, (label, image) in enumerate(zip(pages, images)):
+            target = class_target(label)
             first = pos == 0 or keys[pos] != keys[pos - 1]                  # boundary in raw order
             last = pos == len(pages) - 1 or keys[pos] != keys[pos + 1]
             boundary_changes += first != _true(label["is_first_page"])
@@ -193,9 +202,9 @@ def build_stack_population(config: PipelineConfig):
                 "pdf_page_number": label["pdf_page_number"],
                 "image_path": str(image["image_path"]),
                 "image_sha256": image.get("image_sha256") or "",
-                "has_label": "True",
+                "has_label": str(target != IGNORE_INDEX),
                 "page_class": label["page_class"],
-                "class_target": str(CLASS_TO_ID[label["page_class"]]),
+                "class_target": str(target),
                 "is_first_page": str(first),
                 "segmentation_target": str(int(first)),
                 "is_last_page": str(last),
@@ -207,6 +216,7 @@ def build_stack_population(config: PipelineConfig):
                 "sfdoc_class": label["sfdoc_class"],
                 "label_tier": label["label_tier"],
                 "training_label_quality": label["training_label_quality"],
+                "sst": label["sst"],
             })
 
     used_mids = Counter(row["masterindex_id"] for row in rows)

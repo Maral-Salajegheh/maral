@@ -364,7 +364,7 @@ def precompute_features(args):
     rows = load_model_pages(config)
     selected = training_subset(config, rows, args.limit_stacks, args.training_limit_stacks, args.seed)
     model, payload = load_stage1_checkpoint(args.stage1_checkpoint, device)
-    if payload["metadata"]["population_hash"] != population_hash(rows):
+    if not args.predict_only and payload["metadata"]["population_hash"] != population_hash(rows):
         raise ValueError("Stage 1 checkpoint population is incompatible with current model population")
     model.requires_grad_(False).eval()
     modality = payload["metadata"]["modality"]
@@ -566,14 +566,15 @@ def _stage2_metadata(store, args, input_dim):
             "stage1_features_metadata": store.metadata}
 
 
-def load_stage2_checkpoint(args, store, device, path=None):
+def load_stage2_checkpoint(args, store, device, path=None, check_features=True):
+    """check_features=False only for predicting a new batch: its features differ from the training features."""
     payload = torch.load(path or args.checkpoint, map_location=device)
     metadata = payload.get("metadata", {})
     if metadata.get("architecture") != STAGE2_ARCHITECTURE:
         raise ValueError("Incompatible Stage 2 checkpoint")
     if metadata.get("stage1_checkpoint_sha256") != file_sha256(args.stage1_checkpoint):
         raise ValueError("Stage 1 checkpoint mismatch")
-    if metadata.get("stage1_features_metadata_sha256") != store.metadata_sha256():
+    if check_features and metadata.get("stage1_features_metadata_sha256") != store.metadata_sha256():
         raise ValueError("Stage 1 features mismatch")
     model = SequenceModelRNN(False, len(CLASSES), input_dim=metadata["input_dim"]).to(device)
     model.load_state_dict(payload["model"])
@@ -639,7 +640,7 @@ def predict_stage2(args):
     store, sequences = load_stage1_features(config, args.stage1_features, args.stage1_checkpoint)
     if args.limit_stacks:
         sequences = sequences[:args.limit_stacks]
-    model, _ = load_stage2_checkpoint(args, store, device)
+    model, _ = load_stage2_checkpoint(args, store, device, check_features=not args.predict_only)
     model.eval()
     loader, _ = _stage2_loader(sequences, store, args.max_pages_per_batch, False, False)
     output = []

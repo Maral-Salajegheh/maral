@@ -22,10 +22,12 @@ RUN_INPUTS = {
 def prepare(args):
     config = PipelineConfig(batch_id=args.batch_id)
     rows, population = prepare_model_population(config, args.seed)
-    report = split_report(rows, split_assignments(config, rows, args.seed))
-    write_json_new(config.split_report, report)
-    print(json.dumps({"population": population, "splits": report, "model_pages": str(config.model_pages_csv),
-                      "excluded_stacks": str(config.excluded_stacks_report)}, indent=2))
+    output = {"population": population, "model_pages": str(config.model_pages_csv),
+              "excluded_stacks": str(config.excluded_stacks_report)}
+    if not args.no_splits:
+        output["splits"] = split_report(rows, split_assignments(config, rows, args.seed))
+        write_json_new(config.split_report, output["splits"])
+    print(json.dumps(output, indent=2))
 
 
 def split_rows(config, predictions, split):
@@ -168,7 +170,12 @@ def build_parser():
         command.add_argument("--balance-classes", action=argparse.BooleanOptionalAction, default=True,
                              help="on by default; --no-balance-classes turns it off")
 
-    stage("prepare", device=False, limit=False)
+    def predict_only(command):
+        command.add_argument("--predict-only", action="store_true",
+                             help="new batch, checkpoints from another batch: skip the population/feature checks")
+
+    command = stage("prepare", device=False, limit=False)
+    command.add_argument("--no-splits", action="store_true", help="prediction-only batch: no train/val/test split")
     command = stage("compute_ocr", device=False); subset(command); command.add_argument("--workers", type=int)
     command = stage("compute_visual_embeddings", batch_size=32); subset(command)
     command = stage("migrate_clip_cache", device=False, limit=False)
@@ -190,7 +197,7 @@ def build_parser():
     command.add_argument("--checkpoint", required=True)
     command.add_argument("--output", help="optional; defaults to the batch results folder")
 
-    command = stage("precompute_features", batch_size=8); subset(command); run_lookup(command)
+    command = stage("precompute_features", batch_size=8); subset(command); run_lookup(command); predict_only(command)
     command.add_argument("--stage1-checkpoint")
     command.add_argument("--output", help="default: stage1_features_<modality>_<checkpoint name> in the output folder")
 
@@ -204,7 +211,7 @@ def build_parser():
     command.add_argument("--checkpoint")
     command.add_argument("--split", choices=["train", "val", "test"], default="test")
     command.add_argument("--output", help="optional; defaults to the batch results folder")
-    command = stage("predict_stage2"); stage2_inputs(command); run_lookup(command)
+    command = stage("predict_stage2"); stage2_inputs(command); run_lookup(command); predict_only(command)
     command.add_argument("--checkpoint")
     command.add_argument("--output", help="optional; defaults to the batch results folder")
 
